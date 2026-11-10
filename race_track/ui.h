@@ -1,0 +1,842 @@
+#pragma once
+// Touch (tap a car to follow it, drag to pan, pinch to zoom), on-screen buttons,
+// the settings panel, the leaderboard / timing HUD, start lights, results, the
+// event ticker, and the TV camera that runs when nobody is touching the screen.
+
+#include <WiFi.h>
+#include "settings.h"
+#include "version.h"
+
+#define UI_HIDE_MS        15000UL
+#define AUTOCAM_IDLE_MS   30000UL
+#define TAP_MAX_MS        450
+#define TAP_SLOP          12
+
+static bool     panelOpen = false;
+static uint32_t lastTouchMs = 0;
+static bool     autoCam = true;
+static int      followCar = -1;              // car the camera is locked to (tap / TV)
+
+// ─── Toast (UI messages) ──────────────────────────────────────────────────────
+static char     toastMsg[48] = "";
+static uint32_t toastUntil = 0;
+static void toast(const char* m, uint32_t ms = 1800) {
+  strncpy(toastMsg, m, sizeof(toastMsg) - 1); toastMsg[sizeof(toastMsg) - 1] = 0; toastUntil = millis() + ms;
+}
+
+// ─── Layout ───────────────────────────────────────────────────────────────────
+struct Rect { int16_t x, y, w, h; bool hit(int px, int py) const { return px >= x && px < x + w && py >= y && py < y + h; } };
+
+enum UiId : int8_t {
+  UI_NONE = -1, UI_ZOOM_OUT = 0, UI_ZOOM_IN, UI_HUD, UI_SETTINGS,
+  UI_P_SLIDER, UI_P_WX_PREV, UI_P_WX_NEXT, UI_P_TIME_PREV, UI_P_TIME_NEXT, UI_P_CARS_MINUS, UI_P_CARS_PLUS,
+  UI_P_TRACK_PREV, UI_P_TRACK_NEXT, UI_P_LAPS_PREV, UI_P_LAPS_NEXT, UI_P_SER_PREV, UI_P_SER_NEXT,
+  UI_P_NEXT_RACE, UI_P_CLOSE, UI_COUNT
+};
+
+static const Rect BTN[4] = { { 572, 8, 50, 46 }, { 630, 8, 50, 46 }, { 688, 8, 50, 46 }, { 746, 8, 46, 46 } };
+
+#define PANEL_X 150
+#define PANEL_Y 14
+#define PANEL_W 500
+#define PANEL_H 452
+#define ROW_Y(i) (PANEL_Y + 52 + (i) * 44)
+#define CTRL_X   (PANEL_X + 190)
+#define CTRL_R   (PANEL_X + PANEL_W - 64)
+static const Rect P_SLIDER  = { CTRL_X, ROW_Y(0) - 4, 270, 38 };
+static const Rect P_ARROW_L(int row) { return { CTRL_X, (int16_t)(ROW_Y(row) - 2), 44, 34 }; }
+static const Rect P_ARROW_R(int row) { return { CTRL_R, (int16_t)(ROW_Y(row) - 2), 44, 34 }; }
+static const Rect P_NEXT_RACE = { PANEL_X + 24, PANEL_Y + PANEL_H - 56, 170, 42 };
+static const Rect P_CLOSE     = { PANEL_X + PANEL_W - 132, PANEL_Y + PANEL_H - 56, 108, 42 };
+static const Rect PANEL       = { PANEL_X, PANEL_Y, PANEL_W, PANEL_H };
+
+static uint32_t nextRaceArmUntil = 0;
+
+static bool uiVisible() { return panelOpen || (millis() - lastTouchMs < UI_HIDE_MS); }
+
+static int hitTopButton(int x, int y) {
+  if (!uiVisible()) return UI_NONE;
+  for (int i = 0; i < 4; ++i) if (BTN[i].hit(x, y)) return i;
+  return UI_NONE;
+}
+
+static int hitPanel(int x, int y) {
+  if (P_SLIDER.hit(x, y)) return UI_P_SLIDER;
+  for (int row = 1; row <= 6; ++row) {
+    if (P_ARROW_L(row).hit(x, y)) return UI_P_WX_PREV + (row - 1) * 2;
+    if (P_ARROW_R(row).hit(x, y)) return UI_P_WX_NEXT + (row - 1) * 2;
+  }
+  if (P_NEXT_RACE.hit(x, y)) return UI_P_NEXT_RACE;
+  if (P_CLOSE.hit(x, y)) return UI_P_CLOSE;
+  return UI_NONE;
+}
+
+// ─── Drawing helpers ──────────────────────────────────────────────────────────
+static void blendRoundRect(int x, int y, int w, int h, int r, uint32_t col, uint32_t a) {
+  if (!stripHit(y, y + h)) return;
+  uint16_t c = rgbTo565(col);
+  int yy0 = clipY0 - y > 0 ? clipY0 - y : 0, yy1 = clipY1 - y < h ? clipY1 - y : h;
+  for (int yy = yy0; yy < yy1; ++yy) {
+    int inset = 0;
+    int dy = yy < r ? r - yy : (yy >= h - r ? yy - (h - r - 1) : 0);
+    if (dy > 0) inset = r - (int)sqrtf((float)(r * r - dy * dy));
+    blendSpan(y + yy, x + inset, x + w - 1 - inset, c, a);
+  }
+}
+
+static void drawButtonBg(const Rect& r, bool active, bool pressed) {
+  uint32_t bg = active ? 0xB0302Au : 0x101418u;
+  blendRoundRect(r.x, r.y, r.w, r.h, 10, bg, pressed ? 30 : 22);
+  canvas.drawRoundRect(r.x, r.y, r.w, r.h, 10, active ? 0xF0A0A0u : 0x7A8088u);
+}
+
+static void drawText(const char* s, int x, int y, uint32_t col, const lgfx::IFont* font, textdatum_t datum) {
+  if (!stripHit(y - 16, y + 16)) return;
+  canvas.setFont(font);
+  canvas.setTextDatum(datum);
+  canvas.setTextColor(col);
+  canvas.drawString(s, x, y);
+}
+
+static void iconMinus(int cx, int cy, uint32_t c) { canvas.fillRoundRect(cx - 11, cy - 2, 22, 5, 2, c); }
+static void iconPlus(int cx, int cy, uint32_t c)  { iconMinus(cx, cy, c); canvas.fillRoundRect(cx - 2, cy - 11, 5, 22, 2, c); }
+static void iconList(int cx, int cy, uint32_t c) {
+  for (int k = -1; k <= 1; ++k) { canvas.fillRect(cx - 12, cy + k * 7 - 2, 4, 4, c); canvas.fillRoundRect(cx - 5, cy + k * 7 - 2, 17, 4, 1, c); }
+}
+static void iconGear(int cx, int cy, uint32_t c, uint32_t hole) {
+  for (int k = 0; k < 8; ++k) {
+    float a = k * PI / 4;
+    wideLine(cx + (int)(cosf(a) * 8), cy + (int)(sinf(a) * 8), cx + (int)(cosf(a) * 13), cy + (int)(sinf(a) * 13), 2.6f, c);
+  }
+  fCircle(cx, cy, 10, c);
+  fCircle(cx, cy, 4, hole);
+}
+
+// ─── Panel actions ────────────────────────────────────────────────────────────
+static void applyBrightnessFromX(int x) {
+  float t = clampf((x - P_SLIDER.x - 10) / (float)(P_SLIDER.w - 20), 0, 1);
+  brightness = (uint8_t)(20 + t * 235);
+  display.setBrightness(brightness);
+}
+
+static inline int cyc(int v, int n) { return ((v % n) + n) % n; }
+
+static void panelAction(int id) {
+  switch (id) {
+    case UI_P_WX_PREV: case UI_P_WX_NEXT: {
+      int v = weatherOverride + (id == UI_P_WX_NEXT ? 1 : -1);
+      if (v < -1) v = WEATHER_COUNT - 1;
+      if (v >= WEATHER_COUNT) v = -1;
+      weatherOverride = (int8_t)v;
+      if (v < 0) forceWeatherRefetch();
+      break;
+    }
+    case UI_P_TIME_PREV: case UI_P_TIME_NEXT:
+      currentTimeMode = (TimeMode)cyc((int)currentTimeMode + (id == UI_P_TIME_NEXT ? 1 : -1), TIME_MODE_COUNT);
+      break;
+    case UI_P_CARS_MINUS: case UI_P_CARS_PLUS:
+      carSetting = (uint8_t)clampi(carSetting + (id == UI_P_CARS_PLUS ? 1 : -1), 4, MAX_CARS);
+      toast("Cars: from the next race");
+      break;
+    case UI_P_TRACK_PREV: case UI_P_TRACK_NEXT:
+      trackMode = (uint8_t)cyc(trackMode + (id == UI_P_TRACK_NEXT ? 1 : -1), TRACK_MODE_COUNT);
+      break;
+    case UI_P_LAPS_PREV: case UI_P_LAPS_NEXT:
+      lapsIdx = (uint8_t)cyc(lapsIdx + (id == UI_P_LAPS_NEXT ? 1 : -1), LAPS_OPT_COUNT);
+      raceLaps = LAPS_OPTS[lapsIdx];          // applies to the current race too
+      break;
+    case UI_P_SER_PREV: case UI_P_SER_NEXT:
+      seriesSel = (uint8_t)cyc(seriesSel + (id == UI_P_SER_NEXT ? 1 : -1), SERIES_SEL_COUNT);
+      break;
+    case UI_P_NEXT_RACE:
+      if (millis() < nextRaceArmUntil) {
+        saveSettings();
+        nextRaceRequested = true;
+        panelOpen = false;
+        nextRaceArmUntil = 0;
+      } else {
+        nextRaceArmUntil = millis() + 3000;
+      }
+      break;
+    case UI_P_CLOSE: panelOpen = false; saveSettings(); break;
+    default: break;
+  }
+}
+
+static void topButtonAction(int id) {
+  switch (id) {
+    case UI_ZOOM_OUT: startZoomStep(-1); break;
+    case UI_ZOOM_IN:  startZoomStep(+1); break;
+    case UI_HUD:      hudOn = !hudOn; saveSettings(); break;
+    case UI_SETTINGS: panelOpen = !panelOpen; if (!panelOpen) saveSettings(); break;
+  }
+}
+
+static void onTap(int x, int y) {
+  float wx = s2wx(x), wy = s2wy(y);
+  int c = nearestCar(wx, wy, 22.0f / cam.zoom + 6.0f);
+  if (c >= 0) {
+    followCar = c; autoCam = false;
+    if (cam.zoom < 1.2f) { cam.targetZoom = 1.6f; cam.animZoom = true; cam.anchorSX = SCREEN_CX; cam.anchorSY = SCREEN_CY; }
+    char b[48]; snprintf(b, sizeof(b), "Following P%d %s  (%s, %s)", cars[c].pos, cars[c].code, CLS[cars[c].cls].name, TRAITS[cars[c].trait].name);
+    toast(b, 2500);
+  } else if (followCar >= 0) {
+    followCar = -1; toast("Free camera");
+  }
+}
+
+// ─── Touch state machine ──────────────────────────────────────────────────────
+enum TouchMode : uint8_t { TM_NONE, TM_PENDING, TM_PAN, TM_PINCH, TM_UI, TM_PANEL, TM_SLIDER };
+
+struct TouchState {
+  TouchMode mode = TM_NONE;
+  int16_t sx = 0, sy = 0, lx = 0, ly = 0;
+  uint32_t t0 = 0;
+  int uiId = UI_NONE;
+  float pinchD0 = 1, pinchZ0 = 1, pinchWX = 0, pinchWY = 0;
+  float vx = 0, vy = 0;
+};
+static TouchState ts;
+static int   effN = 0, lowCount = 0;
+static int16_t tpx[2] = { 0, 0 }, tpy[2] = { 0, 0 };
+
+static void onDown(int x, int y) {
+  ts.sx = ts.lx = x; ts.sy = ts.ly = y; ts.t0 = millis();
+  ts.uiId = UI_NONE; ts.vx = ts.vy = 0;
+  cam.vx = cam.vy = 0;
+  if (panelOpen) {
+    int id = hitTopButton(x, y);
+    if (id == UI_SETTINGS) { ts.mode = TM_UI; ts.uiId = id; return; }
+    if (!PANEL.hit(x, y)) { panelOpen = false; saveSettings(); ts.mode = TM_UI; ts.uiId = UI_NONE; return; }
+    id = hitPanel(x, y);
+    if (id == UI_P_SLIDER) { ts.mode = TM_SLIDER; applyBrightnessFromX(x); return; }
+    ts.mode = TM_PANEL; ts.uiId = id;
+    return;
+  }
+  int id = hitTopButton(x, y);
+  if (id != UI_NONE) { ts.mode = TM_UI; ts.uiId = id; return; }
+  ts.mode = TM_PENDING;
+}
+
+static void onMove(int x, int y) {
+  int dx = x - ts.lx, dy = y - ts.ly;
+  switch (ts.mode) {
+    case TM_PENDING:
+      if (abs(x - ts.sx) > TAP_SLOP || abs(y - ts.sy) > TAP_SLOP) { ts.mode = TM_PAN; followCar = -1; }
+      break;
+    case TM_PAN:
+      cam.x -= dx / cam.zoom; cam.y -= dy / cam.zoom; clampCamera();
+      ts.vx = ts.vx * 0.5f + (-dx / cam.zoom) * 0.5f; ts.vy = ts.vy * 0.5f + (-dy / cam.zoom) * 0.5f;
+      cam.animZoom = false;
+      break;
+    case TM_SLIDER: applyBrightnessFromX(x); break;
+    default: break;
+  }
+  ts.lx = x; ts.ly = y;
+}
+
+static void onUp() {
+  switch (ts.mode) {
+    case TM_PENDING: if (millis() - ts.t0 < TAP_MAX_MS) onTap(ts.sx, ts.sy); break;
+    case TM_PAN: cam.vx = ts.vx; cam.vy = ts.vy; break;
+    case TM_UI: if (ts.uiId != UI_NONE && BTN[ts.uiId].hit(ts.lx, ts.ly)) topButtonAction(ts.uiId); break;
+    case TM_PANEL: { int id = hitPanel(ts.lx, ts.ly); if (id != UI_NONE && id == ts.uiId) panelAction(id); break; }
+    case TM_SLIDER: saveSettings(); break;
+    default: break;
+  }
+  ts.mode = TM_NONE;
+}
+
+static void startPinch() {
+  float dx = tpx[1] - tpx[0], dy = tpy[1] - tpy[0];
+  ts.pinchD0 = fmaxf(20.0f, sqrtf(dx * dx + dy * dy));
+  ts.pinchZ0 = cam.zoom;
+  float mx = (tpx[0] + tpx[1]) * 0.5f, my = (tpy[0] + tpy[1]) * 0.5f;
+  ts.pinchWX = s2wx(mx); ts.pinchWY = s2wy(my);
+  ts.mode = TM_PINCH;
+  cam.animZoom = false; cam.vx = cam.vy = 0;
+  followCar = -1;
+}
+
+static void updatePinch() {
+  float dx = tpx[1] - tpx[0], dy = tpy[1] - tpy[0];
+  float d = fmaxf(20.0f, sqrtf(dx * dx + dy * dy));
+  float mx = (tpx[0] + tpx[1]) * 0.5f, my = (tpy[0] + tpy[1]) * 0.5f;
+  cam.zoom = clampf(ts.pinchZ0 * d / ts.pinchD0, ZOOM_MIN, ZOOM_MAX);
+  cam.x = ts.pinchWX - (mx - SCREEN_CX) / cam.zoom;
+  cam.y = ts.pinchWY - (my - SCREEN_CY) / cam.zoom;
+  clampCamera();
+}
+
+// GT911 polled on its own core-0 task (see the koi pond notes).
+static portMUX_TYPE   _touchMux = portMUX_INITIALIZER_UNLOCKED;
+static volatile uint8_t _touchN = 0;
+static int16_t        _touchX[2], _touchY[2];
+
+static void _touchTask(void*) {
+  for (;;) {
+    lgfx::touch_point_t tp2[2];
+    int n = display.getTouch(tp2, 2);
+    portENTER_CRITICAL(&_touchMux);
+    _touchN = (uint8_t)n;
+    for (int i = 0; i < n && i < 2; ++i) { _touchX[i] = tp2[i].x; _touchY[i] = tp2[i].y; }
+    portEXIT_CRITICAL(&_touchMux);
+    vTaskDelay(pdMS_TO_TICKS(15));
+  }
+}
+static void startTouchTask() { xTaskCreatePinnedToCore(_touchTask, "touch", 4096, nullptr, 2, nullptr, 0); }
+
+static void pollTouch() {
+  int raw;
+  portENTER_CRITICAL(&_touchMux);
+  raw = _touchN;
+  for (int i = 0; i < raw && i < 2; ++i) { tpx[i] = _touchX[i]; tpy[i] = _touchY[i]; }
+  portEXIT_CRITICAL(&_touchMux);
+  int prevN = effN;
+  if (raw >= effN) { effN = raw; lowCount = 0; }
+  else if (++lowCount >= 2) { effN = raw; lowCount = 0; }
+  if (effN > 2) effN = 2;
+  if (effN > 0) { lastTouchMs = millis(); autoCam = false; }
+
+  if (prevN == 0 && effN >= 1) {
+    onDown(tpx[0], tpy[0]);
+    if (effN == 2 && (ts.mode == TM_PENDING || ts.mode == TM_PAN)) startPinch();
+  } else if (prevN >= 1 && effN == 0) {
+    onUp();
+  } else if (prevN == 1 && effN == 2) {
+    if (ts.mode == TM_PENDING || ts.mode == TM_PAN) startPinch();
+  } else if (prevN == 2 && effN == 1) {
+    if (ts.mode == TM_PINCH) { ts.mode = TM_PAN; ts.lx = tpx[0]; ts.ly = tpy[0]; ts.vx = ts.vy = 0; }
+  } else if (effN == 2 && ts.mode == TM_PINCH) {
+    updatePinch();
+  } else if (effN >= 1) {
+    onMove(tpx[0], tpy[0]);
+  }
+}
+
+// ─── TV camera ────────────────────────────────────────────────────────────────
+enum TvMode : uint8_t { TV_OVERVIEW, TV_BATTLE, TV_LEADER, TV_CORNER, TV_EVENT, TV_GRID };
+static struct { TvMode mode; int car; int car2; uint32_t until; float tx, ty, tz; } tv = { TV_OVERVIEW, 0, -1, 0, WORLD_W / 2, WORLD_H / 2, ZOOM_MIN };
+
+// The closest fight on track: returns the chasing car, sets `front`.
+static int findBattle(int& front) {
+  int best = -1; float bestScore = 1e9f; front = -1;
+  for (int k = 1; k < numCars; ++k) {
+    const Car& b = cars[order[k]]; const Car& a = cars[order[k - 1]];
+    if (b.state != CS_RACE || a.state != CS_RACE || b.finished) continue;
+    float gap = a.dist - b.dist;
+    if (gap <= 0 || gap > 45) continue;
+    float score = gap + k * 1.5f;
+    if (score < bestScore) { bestScore = score; best = order[k]; front = order[k - 1]; }
+  }
+  return best;
+}
+
+// Ease the camera toward a car, aiming a little ahead of it.
+static void camChase(const Car& c, float tz, const Car* other = nullptr) {
+  float tx = c.x + (c.x - c.px) * 7.0f, ty = c.y + (c.y - c.py) * 7.0f;
+  if (other) { tx = (tx + other->x + (other->x - other->px) * 7.0f) * 0.5f; ty = (ty + other->y + (other->y - other->py) * 7.0f) * 0.5f; }
+  cam.zoom = lerpf(cam.zoom, tz, 0.025f);
+  cam.x = lerpf(cam.x, tx, 0.14f);
+  cam.y = lerpf(cam.y, ty, 0.14f);
+  clampCamera();
+}
+
+static void pickTvShot(uint32_t now) {
+  TvMode prev = tv.mode;
+  if (phase == RP_RESULTS || phase == RP_FINISH) {
+    tv.mode = (prev == TV_OVERVIEW || phase == RP_FINISH) ? TV_LEADER : TV_OVERVIEW;
+  } else if (prev == TV_GRID) {
+    tv.mode = TV_LEADER;
+  } else {
+    float r = frand();
+    tv.mode = r < 0.28f ? TV_OVERVIEW : (r < 0.62f ? TV_BATTLE : (r < 0.78f ? TV_LEADER : TV_CORNER));
+    if (tv.mode == prev && prev == TV_OVERVIEW) tv.mode = TV_BATTLE;
+    if (tv.mode == TV_CORNER && trk.nStands == 0) tv.mode = TV_BATTLE;
+  }
+  switch (tv.mode) {
+    case TV_OVERVIEW: tv.tz = ZOOM_MIN; tv.tx = WORLD_W / 2; tv.ty = WORLD_H / 2; tv.until = now + irandr(18000, 30000); break;
+    case TV_BATTLE:
+      tv.car = findBattle(tv.car2);
+      if (tv.car < 0) { tv.mode = TV_LEADER; tv.car = order[0]; tv.car2 = -1; }
+      tv.tz = frandr(1.6f, 2.2f); tv.until = now + irandr(14000, 24000);
+      break;
+    case TV_LEADER: tv.car = order[0]; tv.car2 = -1; tv.tz = frandr(1.4f, 1.9f); tv.until = now + irandr(10000, 18000); break;
+    case TV_CORNER: {
+      const Stand& st = trk.stands[irandr(0, trk.nStands)];
+      trackPoint(st.sc, (st.side ? 1.0f : -1.0f) * (st.d0 * 0.5f), tv.tx, tv.ty);
+      tv.tz = frandr(1.3f, 1.7f); tv.until = now + irandr(12000, 18000);
+      break;
+    }
+    default: break;
+  }
+}
+
+static void updateTvCam() {
+  uint32_t now = millis();
+  if (!autoCam) {
+    if (followCar >= 0 && followCar < numCars) { camChase(cars[followCar], cam.animZoom ? cam.targetZoom : cam.zoom); return; }
+    if (!panelOpen && ts.mode == TM_NONE && now - lastTouchMs > AUTOCAM_IDLE_MS) { autoCam = true; tv.until = 0; followCar = -1; }
+    else return;
+  }
+  if (phase == RP_GRID && tv.mode != TV_GRID) { tv.mode = TV_GRID; tv.until = now + 120000; tv.tz = 1.7f; }
+  if (spinCamCar >= 0) {
+    if (tv.mode != TV_EVENT && tv.mode != TV_GRID) { tv.mode = TV_EVENT; tv.car = spinCamCar; tv.car2 = -1; tv.tz = 2.0f; tv.until = now + 9000; }
+    spinCamCar = -1;
+  }
+  if (now > tv.until || (tv.mode == TV_GRID && phase != RP_GRID)) pickTvShot(now);
+
+  switch (tv.mode) {
+    case TV_GRID: {                                   // pan slowly up the grid toward pole
+      float back = gridSlotS(numCars - 1), front = gridSlotS(0) + 20;
+      float u = clampf(phaseT / fmx(goAt - 1.0f, 1.0f), 0, 1);
+      float x, y; trackPoint(lerpf(back, front, smooth01(u)), 0, x, y);
+      cam.animZoom = false;
+      cam.zoom = lerpf(cam.zoom, tv.tz, 0.03f);
+      cam.x = lerpf(cam.x, x, 0.06f); cam.y = lerpf(cam.y, y, 0.06f);
+      clampCamera();
+      break;
+    }
+    case TV_BATTLE:
+      if (tv.car >= 0) {
+        const Car* other = (tv.car2 >= 0 && fabsf(cars[tv.car2].dist - cars[tv.car].dist) < 60) ? &cars[tv.car2] : nullptr;
+        camChase(cars[tv.car], tv.tz, other);
+      }
+      break;
+    case TV_LEADER: case TV_EVENT:
+      if (tv.car >= 0) camChase(cars[tv.car], tv.tz);
+      break;
+    default:
+      cam.animZoom = false;
+      cam.zoom = lerpf(cam.zoom, tv.tz, 0.02f);
+      cam.x = lerpf(cam.x, tv.tx, 0.03f);
+      cam.y = lerpf(cam.y, tv.ty, 0.03f);
+      if (fabsf(cam.zoom - tv.tz) < 0.0008f) cam.zoom = tv.tz;     // settle exactly, so the
+      if (fabsf(cam.x - tv.tx) < 0.08f) cam.x = tv.tx;             // renderer can skip static rows
+      if (fabsf(cam.y - tv.ty) < 0.08f) cam.y = tv.ty;
+      clampCamera();
+      break;
+  }
+}
+
+// The car the camera is on, for the highlight ring and name tag.
+static int cameraCar() {
+  if (followCar >= 0) return followCar;
+  if (autoCam && (tv.mode == TV_BATTLE || tv.mode == TV_LEADER || tv.mode == TV_EVENT) && cam.zoom > 1.1f) return tv.car;
+  return -1;
+}
+
+// ─── HUD ──────────────────────────────────────────────────────────────────────
+#define LB_X 6
+#define LB_Y 6
+#define LB_W 124
+#define LB_ROW 13
+#define LB_HEAD 36
+
+// The leaderboard's text is drawn a few times a second into a cached 4-bit
+// palette sprite (~20 KB, in PSRAM), then copied into each strip that
+// overlaps it. Car colour swatches are drawn directly, since 20 liveries don't
+// fit a 16-colour palette. If the 4-bit sprite can't be made (or its pixel
+// layout isn't what we expect), it falls back to a 16-bit sprite in PSRAM.
+enum : uint8_t { LBC_KEY = 0, LBC_WHITE, LBC_LIGHT, LBC_DIM, LBC_GAP, LBC_GOLD, LBC_ORANGE, LBC_PROTO, LBC_GT,
+                 LBC_FL, LBC_LEGEND, LBC_AGG, LBC_CAU, LBC_PAT, LBC_COUNT };
+static const uint32_t LB_PAL[LBC_COUNT] = { 0x000000u, 0xFFFFFFu, 0xC8D0D8u, 0xA8B4BCu, 0xE0E4E8u, 0xF0C040u, 0xFFA040u,
+                                            0x60C0FFu, 0xFFB040u, 0xC890FFu, 0x9AA6B0u, 0xFF5040u, 0x60A8FFu, 0x60D080u };
+static uint8_t traitLbc(uint8_t t) {
+  switch (t) { case TR_AGGRESSIVE: return LBC_AGG; case TR_CAUTIOUS: return LBC_CAU; case TR_PATIENT: return LBC_PAT; default: return LBC_GT; }
+}
+
+static LGFX_Sprite lbSpr(&display);
+static bool     lbOk = false, lbTried = false, lb4 = false, lbHiFirst = true;
+static int      lbStride = 0;                 // bytes per row (4-bit mode)
+static uint16_t lbPal565[16];
+static uint16_t lbKey = 0;                    // 16-bit fallback mode
+static int      lbH = 0;
+static uint32_t lbBuiltMs = 0;
+static bool     lbDirty = true;               // changed since last frame (forces those rows to re-render)
+static int      lbOrd[MAX_CARS];              // order and swatch colours at the last rebuild
+static uint16_t lbSw[MAX_CARS];
+static int      lbN = 0, lbCamC = -1;
+#define LB_SPR_H (LB_HEAD + MAX_CARS * LB_ROW + 34)
+
+static void lbText(const char* s, int x, int y, uint8_t c, const lgfx::IFont* font, textdatum_t datum) {
+  lbSpr.setFont(font); lbSpr.setTextDatum(datum);
+  if (lb4) lbSpr.setTextColor((uint32_t)c); else lbSpr.setTextColor(LB_PAL[c]);
+  lbSpr.drawString(s, x, y);
+}
+static void lbDot(int x, int y, uint8_t c) { if (lb4) lbSpr.fillCircle(x, y, 2, (uint32_t)c); else lbSpr.fillCircle(x, y, 2, LB_PAL[c]); }
+
+static void initLeaderboardSprite() {
+  lbTried = true;
+  lbSpr.setColorDepth(4);
+  lbSpr.setPsram(true);              // PSRAM: internal RAM is needed for WiFi/TLS
+  if (lbSpr.createSprite(LB_W, LB_SPR_H) && lbSpr.createPalette()) {
+    for (int i = 0; i < LBC_COUNT; ++i) lbSpr.setPaletteColor(i, LB_PAL[i]);
+    // Work out the pixel layout: nibble order and row stride.
+    lbSpr.fillScreen((uint32_t)0);
+    lbSpr.drawPixel(0, 0, (uint32_t)1); lbSpr.drawPixel(1, 0, (uint32_t)2); lbSpr.drawPixel(0, 1, (uint32_t)3);
+    const uint8_t* buf = (const uint8_t*)lbSpr.getBuffer();
+    int stride = -1;
+    for (int k = 1; k < 200; ++k) if (buf[k] != 0) { stride = k; break; }
+    if (buf[0] == 0x12 || buf[0] == 0x21) {
+      lbHiFirst = buf[0] == 0x12;
+      lbStride = stride;
+      lb4 = stride >= LB_W / 2 && (buf[stride] == 0x30 || buf[stride] == 0x03);
+    }
+    Serial.printf("Leaderboard cache: 4-bit, bytes %02X %02X, stride %d -> %s\n", buf[0], stride > 0 ? buf[stride] : 0, stride, lb4 ? "ok" : "unexpected layout");
+    if (!lb4) lbSpr.deleteSprite();
+  }
+  if (lb4) {
+    for (int i = 0; i < 16; ++i) lbPal565[i] = toPx(rgbTo565(i < LBC_COUNT ? LB_PAL[i] : 0));
+    lbOk = true;
+    return;
+  }
+  lbSpr.setColorDepth(lgfx::color_depth_t::rgb565_nonswapped);       // fallback: 16-bit in PSRAM
+  lbSpr.setPsram(true);
+  lbOk = lbSpr.createSprite(LB_W, LB_SPR_H) != nullptr;
+  Serial.printf("Leaderboard cache: 16-bit PSRAM fallback %s\n", lbOk ? "ok" : "FAILED");
+}
+
+static void rebuildLeaderboard() {
+  if (!lbTried) initLeaderboardSprite();
+  if (!lbOk) return;
+  if (lb4) lbSpr.fillScreen((uint32_t)LBC_KEY);
+  else { lbSpr.fillScreen((uint16_t)0x0821u); lbKey = ((const uint16_t*)lbSpr.getBuffer())[0]; }
+  char b[32];
+  if (phase == RP_GRID)                              snprintf(b, sizeof(b), "GRID");
+  else if (phase == RP_FINISH || phase == RP_RESULTS) snprintf(b, sizeof(b), "FINISH");
+  else if (raceLaps > 0)                              snprintf(b, sizeof(b), "LAP %d/%d", leaderLapDisplay(), raceLaps);
+  else                                                snprintf(b, sizeof(b), "LAP %d", leaderLapDisplay());
+  lbText(b, 8, 12, LBC_WHITE, &fonts::DejaVu12, textdatum_t::middle_left);
+  lbText(SERIES_NAMES[raceSeries], LB_W - 7, 12, LBC_GOLD, &fonts::DejaVu9, textdatum_t::middle_right);
+  lbText(trk.name, 8, 27, LBC_DIM, &fonts::DejaVu9, textdatum_t::middle_left);
+  lbN = numCars;
+  for (int k = 0; k < numCars; ++k) {
+    int yy = LB_HEAD + k * LB_ROW + 6;
+    const Car& c = cars[order[k]];
+    lbOrd[k] = order[k];
+    lbSw[k] = toPx(rgbTo565(c.c1));
+    snprintf(b, sizeof(b), "%d", k + 1);
+    lbText(b, 18, yy, LBC_LIGHT, &fonts::DejaVu9, textdatum_t::middle_right);
+    lbText(c.code, 29, yy, (c.state == CS_SPIN || c.state == CS_STOPPED) ? LBC_ORANGE : LBC_WHITE, &fonts::DejaVu9, textdatum_t::middle_left);
+    if (c.trait != TR_BALANCED) lbDot(55, yy, traitLbc(c.trait));
+    if (raceSeries == SER_ENDURANCE) lbText(c.cls == CC_PROTO ? "P" : "GT", 61, yy, c.cls == CC_PROTO ? LBC_PROTO : LBC_GT, &fonts::DejaVu9, textdatum_t::middle_left);
+    if (phase == RP_GRID) b[0] = 0;
+    else if (c.finished) snprintf(b, sizeof(b), c.finishPos == 1 ? "WIN" : "FIN");
+    else if (k == 0) { if (c.lastLap > 0) fmtLapTime(b, sizeof(b), c.lastLap); else b[0] = 0; }
+    else {
+      float g = gapToLeader(order[k]);
+      if (g < 0) snprintf(b, sizeof(b), "+%dL", (int)-g); else snprintf(b, sizeof(b), "+%.1f", g);
+    }
+    if (b[0]) lbText(b, LB_W - 7, yy, k == 0 ? LBC_DIM : LBC_GAP, &fonts::DejaVu9, textdatum_t::middle_right);
+  }
+  if (fastestCar >= 0) {
+    int yy = LB_HEAD + numCars * LB_ROW + 8;
+    char t[16]; fmtLapTime(t, sizeof(t), fastestLap);
+    snprintf(b, sizeof(b), "FL %s %s", cars[fastestCar].code, t);
+    lbText(b, 8, yy, LBC_FL, &fonts::DejaVu9, textdatum_t::middle_left);
+  }
+  // Trait legend (Balanced drivers have no dot)
+  int ly = LB_HEAD + numCars * LB_ROW + (fastestCar >= 0 ? 22 : 10);
+  static const uint8_t LEG[4] = { TR_AGGRESSIVE, TR_CAUTIOUS, TR_PATIENT, TR_DEFENSIVE };
+  static const char* const LEG_TXT[4] = { "Agg", "Cau", "Pat", "Def" };
+  for (int k = 0; k < 4; ++k) {
+    int lx = 7 + k * 29;
+    lbDot(lx + 2, ly, traitLbc(LEG[k]));
+    lbText(LEG_TXT[k], lx + 7, ly, LBC_LEGEND, &fonts::DejaVu9, textdatum_t::middle_left);
+  }
+  lbH = ly + 9;
+  lbBuiltMs = millis();
+  lbDirty = true;
+}
+
+// ─── Per-frame UI snapshot (taken before the sim runs ahead on core 0) ────────
+static char     evShow[56] = "";
+static uint32_t evShowUntil = 0;
+static int      ordR[MAX_CARS];
+
+static void prepareResults();
+static void prepareUI() {
+  prepareResults();
+  lbDirty = false;
+  if (hudOn && (!lbBuiltMs || millis() - lbBuiltMs >= 250)) rebuildLeaderboard();
+  int camC = cameraCar();
+  if (camC != lbCamC) { lbCamC = camC; lbDirty = true; }
+  memcpy(evShow, evMsg, sizeof(evShow)); evShow[sizeof(evShow) - 1] = 0;
+  evShowUntil = evUntil;
+  memcpy(ordR, order, sizeof(ordR));
+}
+
+static void drawLeaderboard() {
+  if (!hudOn || !lbOk || lbH == 0) return;
+  if (!stripHit(LB_Y, LB_Y + lbH)) return;
+  blendRoundRect(LB_X, LB_Y, LB_W, lbH, 8, 0x06090Cu, 22);
+  for (int k = 0; k < lbN; ++k) {
+    int yy = LB_Y + LB_HEAD + k * LB_ROW + 6;
+    if (!stripHit(yy - 7, yy + 7)) continue;
+    if (lbOrd[k] == lbCamC) blendRect(LB_X + 3, yy - 6, LB_W - 6, LB_ROW, 0xFFFFFFu, 6);
+    for (int r = yy - 4; r < yy + 5; ++r) if (r >= clipY0 && r < clipY1) { uint16_t* p = fb + r * SCREEN_W + LB_X + 22; p[0] = p[1] = p[2] = lbSw[k]; }
+  }
+  int y0 = clipY0 > LB_Y ? clipY0 : LB_Y, y1 = clipY1 < LB_Y + lbH ? clipY1 : LB_Y + lbH;
+  if (lb4) {
+    const uint8_t* src = (const uint8_t*)lbSpr.getBuffer();
+    const int sh = lbHiFirst ? 4 : 0, sl = lbHiFirst ? 0 : 4;
+    for (int y = y0; y < y1; ++y) {
+      const uint8_t* s = src + (y - LB_Y) * lbStride;
+      uint16_t* d = fb + y * SCREEN_W + LB_X;
+      for (int x = 0; x < LB_W / 2; ++x) {
+        uint8_t v = s[x];
+        if (!v) continue;
+        uint8_t a = (v >> sh) & 15, c = (v >> sl) & 15;
+        if (a) d[2 * x] = lbPal565[a];
+        if (c) d[2 * x + 1] = lbPal565[c];
+      }
+    }
+  } else {
+    const uint16_t* src = (const uint16_t*)lbSpr.getBuffer();
+    for (int y = y0; y < y1; ++y) {
+      const uint16_t* s = src + (y - LB_Y) * LB_W;
+      uint16_t* d = fb + y * SCREEN_W + LB_X;
+      for (int x = 0; x < LB_W; ++x) if (s[x] != lbKey) d[x] = s[x];
+    }
+  }
+}
+
+static void drawStartLights() {
+  if (phase != RP_GRID || phaseT < 1.0f) return;
+  const int cy = 34, sp = 30, x0 = SCREEN_CX - 2 * sp;
+  if (!stripHit(cy - 20, cy + 20)) return;
+  blendRoundRect(x0 - 24, cy - 18, 4 * sp + 48, 36, 10, 0x050505u, 28);
+  for (int i = 0; i < 5; ++i) {
+    bool on = i < lightsOn;
+    fCircle(x0 + i * sp, cy, 10, on ? 0xFF2A1Au : 0x3A1010u);
+    if (on) fCircle(x0 + i * sp - 3, cy - 3, 3, 0xFFA090u);
+  }
+}
+
+static void drawCarTag(int ci) {
+  if (ci < 0 || ci >= numCars || cam.zoom < 1.1f) return;
+  const CarDraw& d = cdraw[ci];
+  int x = (int)d.sx, y = (int)(d.sy - d.hl - 16);
+  if (!stripHit(y - 9, y + 9) || x < 0 || x >= SCREEN_W) return;
+  const Car& c = cars[ci];
+  char b[40]; snprintf(b, sizeof(b), "P%d %s  %s", c.pos, c.code, TRAITS[c.trait].name);
+  canvas.setFont(&fonts::DejaVu9);
+  int w = canvas.textWidth(b) + 14;
+  blendRoundRect(x - w / 2, y - 8, w, 16, 6, 0x06090Cu, 24);
+  canvas.fillRect(x - w / 2 + 3, y - 5, 3, 10, c.c1);
+  drawText(b, x + 3, y, 0xFFFFFFu, &fonts::DejaVu9, textdatum_t::middle_center);
+  int tw = canvas.textWidth(TRAITS[c.trait].name);
+  canvas.fillRect(x + 3 + canvas.textWidth(b) / 2 - tw, y + 5, tw, 1, TRAITS[c.trait].col);   // trait underline
+}
+
+// ─── Results panel: cached opaque 4-bit sprite (PSRAM) ───────────────────────
+// Rebuilt when the results appear and once a second for the countdown, then
+// copied into the strips: blending a 330×150 translucent panel and drawing its
+// text in every strip cost ~15 ms per frame.
+#define RES_W 330
+#define RES_H 150
+#define RES_X (SCREEN_CX - RES_W / 2 + 60)
+#define RES_Y (SCREEN_CY - RES_H / 2)
+enum : uint8_t { RSC_KEY = 0, RSC_BG, RSC_WHITE, RSC_LIGHT, RSC_INK, RSC_GOLD, RSC_SILVER, RSC_BRONZE, RSC_DIM, RSC_FAINT, RSC_CAR0 };
+static LGFX_Sprite resSpr(&display);
+static bool     resOk = false, resTried = false, resHiFirst = true, resDirty = false;
+static int      resStride = 0, resSec = -1;
+static uint16_t resPal565[16];
+
+static void resPal(int i, uint32_t rgb) { resSpr.setPaletteColor(i, rgb); resPal565[i] = toPx(rgbTo565(rgb)); }
+static void resText(const char* s, int x, int y, uint8_t c, const lgfx::IFont* f, textdatum_t d) {
+  resSpr.setFont(f); resSpr.setTextDatum(d); resSpr.setTextColor((uint32_t)c, (uint32_t)RSC_BG); resSpr.drawString(s, x, y);
+}
+
+static void initResultsSprite() {
+  resTried = true;
+  resSpr.setColorDepth(4);
+  resSpr.setPsram(true);
+  if (!resSpr.createSprite(RES_W, RES_H) || !resSpr.createPalette()) { Serial.println("Results cache: FAILED"); return; }
+  resSpr.fillScreen((uint32_t)0);
+  resSpr.drawPixel(0, 0, (uint32_t)1); resSpr.drawPixel(1, 0, (uint32_t)2); resSpr.drawPixel(0, 1, (uint32_t)3);
+  const uint8_t* buf = (const uint8_t*)resSpr.getBuffer();
+  int stride = -1;
+  for (int k = 1; k < 400; ++k) if (buf[k] != 0) { stride = k; break; }
+  resHiFirst = buf[0] == 0x12;
+  resStride = stride;
+  resOk = (buf[0] == 0x12 || buf[0] == 0x21) && stride >= RES_W / 2 && (buf[stride] == 0x30 || buf[stride] == 0x03);
+  Serial.printf("Results cache: %s (stride %d)\n", resOk ? "ok" : "unexpected layout", stride);
+  if (!resOk) { resSpr.deleteSprite(); return; }
+  const uint32_t base[RSC_CAR0] = { 0x000000u, 0x0C1014u, 0xFFFFFFu, 0xC8D0D8u, 0x101010u, 0xF0C840u, 0xC8CCD0u, 0xD08A4Au, 0xA8B4BCu, 0x8A98A0u };
+  for (int i = 0; i < RSC_CAR0; ++i) resPal(i, base[i]);
+}
+
+static void rebuildResults(int secLeft) {
+  if (!resTried) initResultsSprite();
+  if (!resOk) return;
+  resSpr.fillScreen((uint32_t)RSC_KEY);
+  resSpr.fillRoundRect(0, 0, RES_W, RES_H, 14, (uint32_t)RSC_BG);
+  for (int i = 0; i < RES_W - 28; i += 6)                       // chequered strip
+    for (int r = 0; r < 2; ++r) if (((i / 6) + r) & 1) resSpr.fillRect(14 + i, 10 + r * 6, 6, 6, (uint32_t)RSC_WHITE);
+  char b[48];
+  snprintf(b, sizeof(b), "%s  -  %s", trk.name, SERIES_NAMES[raceSeries]);
+  resText(b, RES_W / 2, 36, RSC_LIGHT, &fonts::DejaVu9, textdatum_t::middle_center);
+  for (int k = 0; k < 3 && k < numCars; ++k) {
+    const Car& c = cars[order[k]];
+    int yy = 62 + k * 24;
+    resPal(RSC_CAR0 + k, c.c1);
+    resSpr.fillCircle(34, yy, 9, (uint32_t)(RSC_GOLD + k));
+    snprintf(b, sizeof(b), "%d", k + 1);
+    resSpr.setFont(&fonts::DejaVu12); resSpr.setTextDatum(textdatum_t::middle_center);
+    resSpr.setTextColor((uint32_t)RSC_INK); resSpr.drawString(b, 34, yy);
+    resSpr.fillRect(52, yy - 7, 4, 14, (uint32_t)(RSC_CAR0 + k));
+    resText(c.code, 62, yy, RSC_WHITE, &fonts::DejaVu18, textdatum_t::middle_left);
+    if (c.bestLap > 0) {
+      char t[16]; fmtLapTime(t, sizeof(t), c.bestLap);
+      snprintf(b, sizeof(b), "best %s", t);
+      resText(b, RES_W - 18, yy, RSC_DIM, &fonts::DejaVu9, textdatum_t::middle_right);
+    }
+  }
+  snprintf(b, sizeof(b), "Next race in %d", secLeft);
+  resText(b, RES_W / 2, RES_H - 14, RSC_FAINT, &fonts::DejaVu9, textdatum_t::middle_center);
+  resDirty = true;
+}
+
+static void prepareResults() {
+  resDirty = false;
+  if (phase != RP_RESULTS) { resSec = -1; return; }
+  int sec = (int)fmx(0, RESULTS_SECONDS - phaseT) + 1;
+  if (sec != resSec) { resSec = sec; rebuildResults(sec); }
+}
+
+static void drawResults() {
+  if (phase != RP_RESULTS || !resOk || resSec < 0) return;
+  if (!stripHit(RES_Y, RES_Y + RES_H)) return;
+  const uint8_t* src = (const uint8_t*)resSpr.getBuffer();
+  const int sh = resHiFirst ? 4 : 0, sl = resHiFirst ? 0 : 4;
+  int y0 = clipY0 > RES_Y ? clipY0 : RES_Y, y1 = clipY1 < RES_Y + RES_H ? clipY1 : RES_Y + RES_H;
+  for (int y = y0; y < y1; ++y) {
+    const uint8_t* s = src + (y - RES_Y) * resStride;
+    uint16_t* d = fb + y * SCREEN_W + RES_X;
+    for (int x = 0; x < RES_W / 2; ++x) {
+      uint8_t v = s[x];
+      uint8_t a = (v >> sh) & 15, c = (v >> sl) & 15;
+      if (a) d[2 * x] = resPal565[a];
+      if (c) d[2 * x + 1] = resPal565[c];
+    }
+  }
+}
+
+static void drawEventTicker() {
+  if (millis() > evShowUntil || !evShow[0]) return;
+  int y = SCREEN_H - 34;
+  if (!stripHit(y, y + 26)) return;
+  canvas.setFont(&fonts::DejaVu12);
+  int w = canvas.textWidth(evShow) + 34;
+  int x = SCREEN_CX - w / 2 + (hudOn ? 60 : 0);
+  blendRoundRect(x, y, w, 26, 8, 0x06090Cu, 25);
+  canvas.fillRect(x + 8, y + 6, 4, 14, 0xE02A20u);
+  drawText(evShow, x + w / 2 + 4, y + 13, 0xFFFFFFu, &fonts::DejaVu12, textdatum_t::middle_center);
+}
+
+// ─── Buttons & panel ──────────────────────────────────────────────────────────
+static void drawTopButtons() {
+  if (!uiVisible() || !stripHit(BTN[0].y, BTN[0].y + BTN[0].h)) return;
+  bool pressed[4] = { false, false, false, false };
+  if (ts.mode == TM_UI && ts.uiId >= 0 && ts.uiId < 4) pressed[ts.uiId] = true;
+  const uint32_t ic = 0xF0F4F4u;
+  drawButtonBg(BTN[0], false, pressed[0]); iconMinus(BTN[0].x + BTN[0].w / 2, BTN[0].y + BTN[0].h / 2, cam.zoom > ZOOM_MIN + 0.01f ? ic : 0x6A7A80u);
+  drawButtonBg(BTN[1], false, pressed[1]); iconPlus(BTN[1].x + BTN[1].w / 2, BTN[1].y + BTN[1].h / 2, cam.zoom < ZOOM_MAX - 0.01f ? ic : 0x6A7A80u);
+  drawButtonBg(BTN[2], hudOn, pressed[2]); iconList(BTN[2].x + BTN[2].w / 2, BTN[2].y + BTN[2].h / 2, ic);
+  drawButtonBg(BTN[3], panelOpen, pressed[3]);
+  iconGear(BTN[3].x + BTN[3].w / 2, BTN[3].y + BTN[3].h / 2, ic, panelOpen ? 0xB0302Au : 0x1A2026u);
+}
+
+static void drawArrowBtn(const Rect& r, bool left) {
+  blendRoundRect(r.x, r.y, r.w, r.h, 8, 0x3A4450u, 26);
+  int cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+  if (left) fTri(cx + 6, cy - 9, cx + 6, cy + 9, cx - 7, cy, 0xF0F4F4u);
+  else      fTri(cx - 6, cy - 9, cx - 6, cy + 9, cx + 7, cy, 0xF0F4F4u);
+}
+
+static void drawPanelRow(int row, const char* label, const char* value, bool plusMinus = false) {
+  const lgfx::IFont* f = &fonts::DejaVu12;
+  drawText(label, PANEL_X + 24, ROW_Y(row) + 15, 0xC8D0D8u, f, textdatum_t::middle_left);
+  Rect l = P_ARROW_L(row), r = P_ARROW_R(row);
+  if (plusMinus) {
+    blendRoundRect(l.x, l.y, l.w, l.h, 8, 0x3A4450u, 26); iconMinus(l.x + l.w / 2, l.y + l.h / 2, 0xF0F4F4u);
+    blendRoundRect(r.x, r.y, r.w, r.h, 8, 0x3A4450u, 26); iconPlus(r.x + r.w / 2, r.y + r.h / 2, 0xF0F4F4u);
+  } else {
+    drawArrowBtn(l, true); drawArrowBtn(r, false);
+  }
+  drawText(value, (l.x + r.x + r.w) / 2, ROW_Y(row) + 15, 0xFFFFFFu, f, textdatum_t::middle_center);
+}
+
+static void drawPanel() {
+  if (!panelOpen || !stripHit(PANEL_Y, PANEL_Y + PANEL_H)) return;
+  blendRoundRect(PANEL_X, PANEL_Y, PANEL_W, PANEL_H, 14, 0x0A0E12u, 28);
+  canvas.drawRoundRect(PANEL_X, PANEL_Y, PANEL_W, PANEL_H, 14, 0x7A8088u);
+  drawText("Race settings", PANEL_X + 24, PANEL_Y + 26, 0xF4F8F8u, &fonts::DejaVu18, textdatum_t::middle_left);
+  char buf[48];
+
+  drawText("Brightness", PANEL_X + 24, ROW_Y(0) + 15, 0xC8D0D8u, &fonts::DejaVu12, textdatum_t::middle_left);
+  int sx0 = P_SLIDER.x + 10, sw = P_SLIDER.w - 20, sy = P_SLIDER.y + P_SLIDER.h / 2;
+  canvas.fillRoundRect(sx0, sy - 3, sw, 6, 3, 0x3A4450u);
+  int knob = sx0 + (int)((brightness - 20) / 235.0f * sw);
+  canvas.fillRoundRect(sx0, sy - 3, knob - sx0, 6, 3, 0xE04A3Au);
+  fCircle(knob, sy, 11, 0xF4F8F8u);
+
+  if (weatherOverride < 0) snprintf(buf, sizeof(buf), "Auto: %s", weatherLiveOk ? WEATHER_NAMES[currentWeather] : "--");
+  else snprintf(buf, sizeof(buf), "%s", WEATHER_NAMES[weatherOverride]);
+  drawPanelRow(1, "Weather", buf);
+  if (currentTimeMode == TIME_REAL && !timeSynced()) snprintf(buf, sizeof(buf), "Real (no clock yet)");
+  else snprintf(buf, sizeof(buf), "%s", TIME_MODE_NAMES[currentTimeMode]);
+  drawPanelRow(2, "Time of day", buf);
+  snprintf(buf, sizeof(buf), "%d", carSetting);
+  drawPanelRow(3, "Cars", buf, true);
+  drawPanelRow(4, "Track", trackModeName(trackMode));
+  if (LAPS_OPTS[lapsIdx] == 0) snprintf(buf, sizeof(buf), "Endless"); else snprintf(buf, sizeof(buf), "%d laps", LAPS_OPTS[lapsIdx]);
+  drawPanelRow(5, "Race length", buf);
+  drawPanelRow(6, "Series", seriesSelName(seriesSel));
+
+  bool armed = millis() < nextRaceArmUntil;
+  blendRoundRect(P_NEXT_RACE.x, P_NEXT_RACE.y, P_NEXT_RACE.w, P_NEXT_RACE.h, 10, armed ? 0xB02A20u : 0x3A4450u, 26);
+  drawText(armed ? "Tap again" : "Next race now", P_NEXT_RACE.x + P_NEXT_RACE.w / 2, P_NEXT_RACE.y + P_NEXT_RACE.h / 2, 0xFFFFFFu, &fonts::DejaVu12, textdatum_t::middle_center);
+  snprintf(buf, sizeof(buf), "v%s  WiFi %s", FIRMWARE_VERSION, WiFi.status() == WL_CONNECTED ? "on" : "off");
+  drawText(buf, P_NEXT_RACE.x + P_NEXT_RACE.w + 16, P_CLOSE.y + P_CLOSE.h / 2, 0x8A98A0u, &fonts::DejaVu9, textdatum_t::middle_left);
+  blendRoundRect(P_CLOSE.x, P_CLOSE.y, P_CLOSE.w, P_CLOSE.h, 10, 0xB0302Au, 28);
+  drawText("Done", P_CLOSE.x + P_CLOSE.w / 2, P_CLOSE.y + P_CLOSE.h / 2, 0xFFFFFFu, &fonts::DejaVu12, textdatum_t::middle_center);
+}
+
+static void drawToast() {
+  if (millis() > toastUntil || !toastMsg[0]) return;
+  int y = SCREEN_H - 76;
+  if (!stripHit(y, y + 34)) return;
+  canvas.setFont(&fonts::DejaVu12);
+  int w = canvas.textWidth(toastMsg) + 36;
+  blendRoundRect(SCREEN_CX - w / 2, y, w, 34, 12, 0x0A0E12u, 26);
+  drawText(toastMsg, SCREEN_CX, y + 17, 0xF4F8F8u, &fonts::DejaVu12, textdatum_t::middle_center);
+}
+
+// Mark the screen rows the UI changes this frame (see markDynamicRows in the .ino).
+static void uiDynamicRows(void (*mark)(int, int)) {
+  if (hudOn && lbDirty) mark(LB_Y, LB_Y + LB_SPR_H);
+  if (phase == RP_GRID) mark(14, 54);
+  if (resDirty) mark(RES_Y, RES_Y + RES_H);
+  if (millis() <= evShowUntil + 100) mark(SCREEN_H - 36, SCREEN_H - 6);
+  if (millis() <= toastUntil + 100) mark(SCREEN_H - 78, SCREEN_H - 40);
+  if (uiVisible() || millis() - lastTouchMs < UI_HIDE_MS + 200) mark(BTN[0].y - 2, BTN[0].y + BTN[0].h + 2);
+  if (panelOpen) mark(PANEL_Y, PANEL_Y + PANEL_H);
+  int cc = cameraCar();
+  if (cc >= 0 && cc < numCars && cam.zoom >= 1.1f) { int ty = (int)(cdraw[cc].sy - cdraw[cc].hl - 16); mark(ty - 10, ty + 10); }
+}
+
+static uint32_t uiProf[8] = {0};
+#define UIP(i, call) do { uint32_t _t = micros(); call; uiProf[i] += micros() - _t; } while (0)
+static void drawUI() {
+  UIP(0, drawCarTag(cameraCar()));
+  UIP(1, drawLeaderboard());
+  UIP(2, drawStartLights());
+  UIP(3, drawResults());
+  UIP(4, drawEventTicker());
+  UIP(5, drawTopButtons());
+  UIP(6, drawPanel());
+  UIP(7, drawToast());
+}

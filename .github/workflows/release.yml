@@ -1,0 +1,80 @@
+name: Build and Release Firmware
+
+# Trigger on version tags, e.g.  git tag v0.1.1 && git push origin v0.1.1
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed to create the GitHub release
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up arduino-cli
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Cache Arduino packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.arduino15
+          key: ${{ runner.os }}-arduino-esp32-3.3.0
+
+      - name: Install ESP32 core and libraries
+        run: |
+          arduino-cli config init --overwrite
+          arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@3.3.0
+          arduino-cli lib install "LovyanGFX@1.2.21" "ArduinoJson@6.21.6"
+
+      # The stock LovyanGFX RGB bus doesn't work on the CrowPanel with core 3.x.
+      # Overlay the fixed esp32s3 files (same ones as the local Arduino library).
+      - name: Apply LovyanGFX RGB fix
+        run: |
+          USERDIR=$(arduino-cli config get directories.user 2>/dev/null || echo "$HOME/Arduino")
+          LIB="$USERDIR/libraries/LovyanGFX/src/lgfx/v1/platforms/esp32s3"
+          test -d "$LIB"
+          cp lovyangfx-fix/Bus_RGB.cpp lovyangfx-fix/Panel_RGB.cpp "$LIB/"
+
+      - name: Set firmware version from tag
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          sed -i "s/#define FIRMWARE_VERSION.*/#define FIRMWARE_VERSION  \"${VER}\"/" race_track/version.h
+
+      # Secrets required (Settings → Secrets and variables → Actions):
+      #   WIFI_SSID, WIFI_PASSWORD
+      #   WEATHER_API_KEY, WEATHER_LAT, WEATHER_LON   (OpenWeatherMap; key may be empty)
+      #   TIMEZONE_OFFSET_HOURS                       (e.g. -6; defaults to 0)
+      - name: Create wifi_config.h from secrets
+        env:
+          WIFI_SSID: ${{ secrets.WIFI_SSID }}
+          WIFI_PASSWORD: ${{ secrets.WIFI_PASSWORD }}
+          WEATHER_API_KEY: ${{ secrets.WEATHER_API_KEY }}
+          WEATHER_LAT: ${{ secrets.WEATHER_LAT }}
+          WEATHER_LON: ${{ secrets.WEATHER_LON }}
+          TZ_HOURS: ${{ secrets.TIMEZONE_OFFSET_HOURS || '0' }}
+        run: |
+          printf '#pragma once\n#define WIFI_SSID "%s"\n#define WIFI_PASSWORD "%s"\n#define WEATHER_API_KEY "%s"\n#define WEATHER_LAT "%s"\n#define WEATHER_LON "%s"\n#define TIMEZONE_OFFSET_HOURS %s\n' \
+            "$WIFI_SSID" "$WIFI_PASSWORD" "$WEATHER_API_KEY" "$WEATHER_LAT" "$WEATHER_LON" "$TZ_HOURS" \
+            > race_track/wifi_config.h
+
+      - name: Build firmware
+        run: |
+          arduino-cli compile \
+            --fqbn "esp32:esp32:esp32s3:PSRAM=opi,PartitionScheme=min_spiffs,FlashSize=4M" \
+            --output-dir build race_track
+          cp build/race_track.ino.bin firmware.bin
+
+      - name: Create GitHub Release with firmware binary
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" firmware.bin \
+            --title "Race Track Firmware $GITHUB_REF_NAME" \
+            --notes "The device flashes this release automatically the next time it boots with WiFi. For a manual flash, use esptool.py or the Arduino IDE with firmware.bin."

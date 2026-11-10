@@ -1,0 +1,17 @@
+#pragma once
+// Copy this file to wifi_config.h and fill in your settings.
+// wifi_config.h is listed in .gitignore and will never be committed.
+
+// ── WiFi (used for OTA updates and weather) ───────────────────────────────────
+#define WIFI_SSID     "your_ssid"
+#define WIFI_PASSWORD "your_password"
+
+// ── OpenWeatherMap (https://openweathermap.org/api — free tier is enough) ────
+// LAT/LON as decimal strings, e.g. "51.5074" / "-0.1278".
+// Leave WEATHER_API_KEY empty ("") to disable live weather.
+#define WEATHER_API_KEY "your_openweathermap_api_key"
+#define WEATHER_LAT     "51.5074"
+#define WEATHER_LON     "-0.1278"
+
+// ── Day/night timezone — integer hours from UTC (e.g. -6 for CST) ─────────────
+#define TIMEZONE_OFFSET_HOURS 0

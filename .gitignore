@@ -1,0 +1,13 @@
+# Local credentials — copy race_track/wifi_config.h.template and fill it in
+race_track/wifi_config.h
+
+# Build output
+build/
+race_track/build/
+.pio/
+*.bin
+*.elf
+*.map
+
+# Device flash backups (contain WiFi credentials / NVS data)
+backups/
