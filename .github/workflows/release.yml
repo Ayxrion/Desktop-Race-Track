@@ -60,6 +60,12 @@ jobs:
           WEATHER_LON: ${{ secrets.WEATHER_LON }}
           TZ_HOURS: ${{ secrets.TIMEZONE_OFFSET_HOURS || '0' }}
         run: |
+          # Refuse to build without WiFi: the device installs any newer release on
+          # boot, and a build with no WiFi would leave it unable to update again.
+          if [ -z "$WIFI_SSID" ] || [ -z "$WIFI_PASSWORD" ]; then
+            echo "::error::WIFI_SSID / WIFI_PASSWORD secrets are missing - not building a release"
+            exit 1
+          fi
           printf '#pragma once\n#define WIFI_SSID "%s"\n#define WIFI_PASSWORD "%s"\n#define WEATHER_API_KEY "%s"\n#define WEATHER_LAT "%s"\n#define WEATHER_LON "%s"\n#define TIMEZONE_OFFSET_HOURS %s\n' \
             "$WIFI_SSID" "$WIFI_PASSWORD" "$WEATHER_API_KEY" "$WEATHER_LAT" "$WEATHER_LON" "$TZ_HOURS" \
             > race_track/wifi_config.h
