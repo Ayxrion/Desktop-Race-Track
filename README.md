@@ -6,8 +6,8 @@ It uses the same board setup and rendering approach as the koi pond (Desktop Aqu
 
 ## What's on the track
 
-- **Circuits**: ten real-circuit layouts (approximate), plus procedurally generated ones.
-  The presets are Monza, Spa-Francorchamps, Silverstone, Interlagos, Red Bull Ring, Circuit of the Americas, Zandvoort, Hungaroring, Watkins Glen and Imola.
+- **Circuits**: eleven real-circuit layouts (approximate), plus procedurally generated ones.
+  The presets are Monza, Spa-Francorchamps, Silverstone, Interlagos, Red Bull Ring, Circuit of the Americas, Zandvoort, Hungaroring, Watkins Glen, Imola and Road America.
   By default the device alternates between a preset and a new random circuit for each race.
 - **Trackside**: red and white kerbs, gravel traps and tarmac run-off sized to each corner, armco and tyre walls, a pit lane with garages and a paddock, grandstands with crowds on the slowest corners, and forests and fields around the outside.
 - **Series**: Formula (open-wheelers in team pairs), GT, Touring, Endurance (prototypes and GTs together) and Classic (1960s cigar-shaped cars in national colours).
@@ -109,4 +109,5 @@ Every baked pixel finds its nearest centreline segment through a 4 px nearest-sa
 ## Credits
 
 Real-circuit layouts are derived from [bacinger/f1-circuits](https://github.com/bacinger/f1-circuits) (MIT licence).
+Road America comes from [OpenStreetMap](https://www.openstreetmap.org/copyright) raceway data, © OpenStreetMap contributors, available under the ODbL.
 They're simplified, and track widths are exaggerated on screen.
