@@ -52,11 +52,11 @@ struct TraitSpec {
 };
 static const TraitSpec TRAITS[TR_COUNT] = {
   //  name          col        corner straight brake wet   sigma  aware margin gap  room  follow mist spin  attack yield block
-  { "Aggressive", 0xFF5040u, 1.100f, 1.015f, 1.14f, 0.70f, 0.050f, 0.35f,  1.0f, 4.0f, -0.8f, 0.22f, 2.2f, 2.2f, true,  false, false },
+  { "Aggressive", 0xFF5040u, 1.016f, 1.003f, 1.03f, 0.82f, 0.032f, 0.50f,  1.5f, 3.6f, -0.5f, 0.28f, 1.4f, 1.5f, true,  false, false },
   { "Balanced",   0xE8E8E8u, 1.000f, 1.000f, 1.00f, 0.92f, 0.025f, 0.75f,  3.0f, 3.0f,  0.0f, 0.45f, 1.0f, 1.0f, false, false, false },
-  { "Cautious",   0x60A8FFu, 0.960f, 0.995f, 0.92f, 1.00f, 0.012f, 1.00f,  6.0f, 2.6f,  0.8f, 0.70f, 0.5f, 0.5f, false, false, false },
-  { "Patient",    0x60D080u, 0.940f, 0.990f, 0.88f, 1.05f, 0.008f, 1.00f, 10.0f, 2.2f,  1.2f, 0.95f, 0.3f, 0.3f, false, true,  false },
-  { "Defensive",  0xFFB040u, 0.990f, 1.000f, 1.02f, 0.92f, 0.022f, 0.75f,  3.0f, 3.0f,  0.0f, 0.40f, 0.9f, 1.0f, false, false, true  },
+  { "Cautious",   0x60A8FFu, 0.995f, 0.999f, 0.985f, 1.00f, 0.018f, 0.90f,  4.0f, 2.8f,  0.4f, 0.55f, 0.7f, 0.7f, false, false, false },
+  { "Patient",    0x60D080u, 0.990f, 0.998f, 0.975f, 1.02f, 0.014f, 0.95f,  5.0f, 2.6f,  0.6f, 0.65f, 0.5f, 0.5f, false, true,  false },
+  { "Defensive",  0xFFB040u, 0.999f, 1.000f, 1.005f, 0.92f, 0.022f, 0.75f,  3.0f, 3.0f,  0.0f, 0.42f, 0.9f, 1.0f, false, false, true  },
 };
 static const uint8_t TRAIT_WEIGHTS[TR_COUNT] = { 25, 30, 20, 10, 15 };
 
@@ -76,6 +76,10 @@ struct Car {
   float commit;             // commitment for the coming corner (×1)
   float spinV, travel;      // spinning: yaw rate, direction of the slide
   float perf, skill;
+  float form;               // slowly drifting pace offset (×), so gaps open and close
+  float pressT;             // > 0 while someone is close behind (more mistakes)
+  float tow;                // 0..1: how much tow this car is getting
+  float concedeT;           // > 0: giving the corner to a car alongside on the inside
   float react;              // start reaction delay (s)
   float passT; int8_t passSide; int8_t passCar;
   float blockT, blockCd, yieldT; int8_t yieldSide;
@@ -191,7 +195,7 @@ static void setupCars(int n, uint8_t series, uint32_t seed) {
     memcpy(c.code, DRIVER_CODES[codes[i % NUM_CODES]], 3); c.code[3] = 0;
     c.num = (uint8_t)irandr(1, 99);
     c.trait = pickTrait();
-    c.perf = frandr(0.962f, 1.0f);
+    c.perf = frandr(0.988f, 1.0f);
     c.skill = frandr(0.86f, 0.99f);
     c.react = frandr(0.05f, 0.45f) * (c.trait == TR_AGGRESSIVE ? 0.7f : (c.trait == TR_PATIENT ? 1.3f : 1.0f));
     c.commit = 1.0f;
@@ -220,6 +224,29 @@ static void setupCars(int n, uint8_t series, uint32_t seed) {
   evN = 0;
   _rng = save;
 }
+
+// ─── Racing: pace variation, tow, passing ─────────────────────────────────────
+// Traits change behaviour more than raw pace; what makes the racing close is
+// below. Tuned with the PC harness over 180 races: leader changes went from
+// 0.37 to ~1.2 a race and pole-to-win from 88% to ~56%.
+#define FORM_TAU       25.0f    // s: how quickly a driver's form drifts
+#define FORM_SD        0.010f   // typical form offset (×): gaps open and close
+#define LEAD_EASE_T0   0.3f     // s: a leader further ahead than this...
+#define LEAD_EASE      0.015f   // ...backs off by up to this much (×), managing the gap
+#define PRESS_T        0.8f     // s: a car this close behind puts you under pressure...
+#define PRESSURE_MIST  2.0f     // ...and doubles your chance of a mistake
+#define TOW_T0         0.5f     // s behind: full tow inside this
+#define TOW_T1         1.2f     // s behind: no tow beyond this
+#define TOW_GAIN       0.08f    // top-speed gain at full tow (×)
+#define TOW_ACC        0.6f     // extra acceleration at full tow and top speed (×)
+#define BOXED_LEN      2.0f     // car lengths: closer than this and not passing, the tow can't be used
+#define PASS_T         0.35f    // s: a balanced driver goes for it from this far back
+#define ATTACK_COMMIT  1.015f   // how much later anyone brakes into a corner when going for a pass
+#define DIVE_BRAKE     1.15f    // braking a driver dares while committed to a pass (×, within the car's limit)
+#define ATTACK_LINE    0.4f     // off-line cornering penalty while committed to a pass (×)
+#define OVERLAP_NEED   0.5f     // car lengths of overlap needed on the inside before the other car gives way
+#define CONCEDE        0.96f    // a car giving the corner lifts this much (×)
+#define YIELD_DV       6.0f     // px/s: how much quicker a car must be before a patient driver waves it by
 
 // ─── Physics helpers ──────────────────────────────────────────────────────────
 static inline float gripFactor() { return 1.0f - 0.14f * wetAmt - 0.14f * snowCover; }
@@ -267,7 +294,7 @@ static void cornerEntry(Car& c) {
   const TraitSpec& T = TRAITS[c.trait];
   float g = (frand() + frand() + frand() - 1.5f) * 2.0f;            // ~N(0,1)
   c.commit = 1.0f + g * T.sigma * (1.6f - c.skill);
-  float p = (1.0f - c.skill) * 0.09f * T.mistake * (1.0f + 2.5f * wetAmt + 3.0f * snowCover);
+  float p = (1.0f - c.skill) * 0.09f * T.mistake * (1.0f + 2.5f * wetAmt + 3.0f * snowCover) * (c.pressT > 0 ? PRESSURE_MIST : 1.0f);
   if (frand() < p) { c.commit += frandr(0.08f, 0.24f); c.lockT = 0.35f; }  // a lapse: brakes far too late
 }
 
@@ -318,18 +345,50 @@ static void updateCars(float dt, bool racing, bool coolDown) {
       // ── Target speed: the driver's own braking for what they think the grip is ──
       const float wxBelief = powf(wx, T.wetAdapt);
       const float gT = gCar * wxBelief * T.corner * c.commit;
-      const float ab = A_BRK * T.brake * sqrtf(gCar) * wxBelief;
-      float vT = V_TOP * cs.top * c.perf * T.straight;
+      const float ab = A_BRK * T.brake * sqrtf(gCar) * wxBelief * (c.passT > 0 ? DIVE_BRAKE : 1.0f);
+      if (racing) {                                // drift the driver's form
+        float g = (frand() + frand() + frand() - 1.5f) * 2.0f;
+        c.form += -c.form * (dt / FORM_TAU) + FORM_SD * sqrtf(2.0f * dt / FORM_TAU) * g;
+        c.form = clampf(c.form, -2.5f * FORM_SD, 2.5f * FORM_SD);
+      }
+      float ease = 0;                              // a leader with a cushion manages the gap
+      if (c.pos == 1 && numCars > 1 && racing && !c.finished) {
+        const Car& b = cars[order[1]];
+        float gapT = (c.dist - b.dist) / fmx(c.v, 60.0f);
+        ease = LEAD_EASE * clampf((gapT - LEAD_EASE_T0) / 1.0f, 0, 1);
+      }
+      const float fm = 1.0f + c.form - ease;
+      float vT = V_TOP * cs.top * c.perf * T.straight * fm;
       const float sg = sqrtf(gT);
       for (float u = 0; u <= 180.0f; u += 10.0f) {
-        float vc = tp[idxAt(c.s + u)].vc * sg;
+        float vc = tp[idxAt(c.s + u)].vc * sg * fm;
         float lim = vc * vc + 2.0f * ab * u;
         if (lim < vT * vT) vT = sqrtf(lim);
       }
       float off = clampf(fabsf(c.dPath - f.rl) / hw, 0, 1);
-      vT *= 1.0f - 0.12f * T.lineAware * off * clampf(fabsf(f.k) * 80.0f, 0, 1);
+      vT *= 1.0f - 0.12f * T.lineAware * (c.passT > 0 ? ATTACK_LINE : 1.0f) * off * clampf(fabsf(f.k) * 80.0f, 0, 1);
+      if (c.concedeT > 0) { c.concedeT -= dt; vT *= CONCEDE; }
       if (coolDown || c.finished) vT *= 0.6f;
       if (c.recoverT > 0) { c.recoverT -= dt; vT = fmn(vT, 45.0f); }
+      // Tow: on a straight, the air behind another car is thinner. It helps from
+      // about a second back and most when right under the rear wing.
+      c.tow = 0;
+      if (racing && fabsf(f.k) < 1.0f / 400.0f) {
+        const float towRange = fmx(c.v, 60.0f) * TOW_T1;
+        float towG = towRange;
+        for (int j = 0; j < numCars; ++j) {
+          if (j == i) continue;
+          const Car& o = cars[j];
+          float g = sDelta(c.s, o.s);
+          if (g > 4.0f && g < towG && fabsf(o.d - c.d) < hw * 0.8f && o.state == CS_RACE) towG = g;
+        }
+        if (towG < towRange) {
+          float tg = towG / fmx(c.v, 60.0f);          // time gap, s
+          c.tow = clampf((TOW_T1 - tg) / (TOW_T1 - TOW_T0), 0, 1);
+          vT *= 1.0f + TOW_GAIN * c.tow;
+        }
+      }
+      if (c.pressT > 0) c.pressT -= dt;
       const float vFree = vT;                      // before traffic
 
       // ── Traffic ──
@@ -340,8 +399,10 @@ static void updateCars(float dt, bool racing, bool coolDown) {
         const Car& o = cars[j];
         float g = sDelta(c.s, o.s);
         float widAvg = (cs.wid + CLS[o.cls].wid) * 0.5f;
-        if (g > 0 && g < 70 && fabsf(o.d - c.d) < widAvg + 1.5f && g < aheadGap) { ahead = j; aheadGap = g; }
+        float latBand = (c.passT > 0 && o.state == CS_RACE) ? widAvg + 0.8f : widAvg + 1.5f;   // pulling out to pass: free once fully clear
+        if (g > 0 && g < 70 && fabsf(o.d - c.d) < latBand && g < aheadGap) { ahead = j; aheadGap = g; }
         if (g < 0 && -g < 3.0f * cs.len && o.state == CS_RACE && o.passT > 0 && o.passCar == i && -g < attackGap) { attacker = j; attackGap = -g; }
+        if (g < 0 && -g < fmx(2.5f * cs.len, o.v * PRESS_T) && o.state == CS_RACE && racing) c.pressT = 1.0f;
       }
       float dT = f.rl + (tp[idxAt(c.s + 14.0f)].rl - f.rl);
       const bool cornerNear = fabsf(f.k) > 1.0f / 150.0f || fabsf(tp[idxAt(c.s + 45.0f)].k) > 1.0f / 150.0f;
@@ -351,9 +412,13 @@ static void updateCars(float dt, bool racing, bool coolDown) {
         float lenAvg = (cs.len + CLS[a.cls].len) * 0.5f, widAvg = (cs.wid + CLS[a.cls].wid) * 0.5f;
         float gap = aheadGap - lenAvg;
         bool lapping = c.dist - a.dist > trk.L * 0.5f;
-        bool faster = vFree > a.v + T.passMargin || a.state != CS_RACE || (lapping && vFree > a.v);
+        // only a real speed edge counts: not just that they're already braking for a corner
+        const bool aAtSpeed = !a.braking && fabsf(tp[idxAt(a.s)].k) < 1.0f / 250.0f;
+        const bool dive = T.cornerAttack && gap < lenAvg * 1.2f;
+        bool faster = (vFree > a.v + T.passMargin && (aAtSpeed || dive)) || a.state != CS_RACE || (lapping && vFree > a.v);
         bool allowed = T.cornerAttack || !cornerNear || a.state != CS_RACE || lapping;
-        if (c.passT <= 0 && faster && allowed && gap < T.passGap * lenAvg && racing && !coolDown) {
+        const float passWin = fmx(T.passGap * lenAvg, c.v * PASS_T * (T.passGap / 3.0f));
+        if (c.passT <= 0 && faster && allowed && gap < passWin && racing && !coolDown) {
           const float hwP = hwC + 1.8f;            // may use the kerbs
           float roomR = hwP - (a.d + widAvg + 1.2f) - T.passRoom;
           float roomL = (a.d - widAvg - 1.2f) + hwP - T.passRoom;
@@ -364,17 +429,33 @@ static void updateCars(float dt, bool racing, bool coolDown) {
             float roomIn = inside > 0 ? roomR : roomL, roomOut = inside > 0 ? roomL : roomR;
             c.passSide = (roomIn > 0 && (roomIn >= roomOut - 2.0f || T.cornerAttack)) ? inside : -inside;
             c.passT = 2.5f; c.passCar = (int8_t)ahead;
-            if (T.cornerAttack && cornerNear) c.commit = fmx(c.commit, 1.03f);   // late on the brakes
+            if (cornerNear) c.commit = fmx(c.commit, T.cornerAttack ? 1.03f : ATTACK_COMMIT);   // late on the brakes
           }
         }
         float fg = T.followGap * lenAvg;
+        if (gap < lenAvg * BOXED_LEN && c.passT <= 0) c.tow = 0;    // boxed in: can't use the tow to accelerate
         if (gap < lenAvg * 1.5f) vT = fmn(vT, fmx(0.0f, a.v + (gap - fg) * 2.2f));
-        if (gap < lenAvg * 3.0f && fabsf(f.k) < 1.0f / 400.0f) vT *= 1.0f + 0.04f * T.straight;   // slipstream
       }
       if (c.passT > 0 && c.passCar >= 0) {
         const Car& a = cars[c.passCar];
         float widAvg = (cs.wid + CLS[a.cls].wid) * 0.5f;
-        dT = clampf(a.dPath + c.passSide * (widAvg + 1.5f), -hwC - 1.8f, hwC + 1.8f);
+        const float lane = widAvg + 1.5f, edge = hwC + 1.8f;
+        float want = a.dPath + c.passSide * lane;
+        if (fabsf(want) > edge) {                  // they've closed that side
+          float other = a.dPath - c.passSide * lane;
+          bool alongside = sDelta(c.s, a.s) < (cs.len + CLS[a.cls].len) * 0.5f;
+          if (fabsf(other) <= edge && !alongside) { c.passSide = (int8_t)-c.passSide; want = other; }   // switch
+          else if (!alongside) c.passT = 0;        // tuck back in behind
+        }
+        dT = clampf(want, -edge, edge);
+        // alongside and on the inside of the next corner: the other car gives way
+        {
+          float kN = tp[idxAt(c.s + 40.0f)].k;
+          bool inside = (kN > 1.0f / 300.0f && c.passSide > 0) || (kN < -1.0f / 300.0f && c.passSide < 0);
+          float overlap = sDelta(a.s, c.s);           // > 0: we're ahead of them
+          if (inside && overlap > -(cs.len * OVERLAP_NEED) && !TRAITS[a.trait].cornerAttack && !TRAITS[a.trait].blocks)
+            cars[c.passCar].concedeT = 0.5f;
+        }
         c.passT -= dt;
         if (sDelta(a.s, c.s) > (cs.len + CLS[a.cls].len) * 0.5f + 3.0f) c.passT = fmn(c.passT, 0.5f);   // done
         if (fabsf(sDelta(a.s, c.s)) > 90.0f) c.passT = 0;
@@ -383,7 +464,7 @@ static void updateCars(float dt, bool racing, bool coolDown) {
       if (attacker >= 0 && racing && !coolDown) {
         const Car& o = cars[attacker];
         bool lapped = o.dist - c.dist > trk.L * 0.5f;
-        if (T.yields || lapped) {
+        if ((T.yields && o.v > c.v + YIELD_DV) || lapped) {
           if (c.yieldT <= 0) { c.yieldT = 2.0f; c.yieldSide = (int8_t)(o.passSide > 0 ? -1 : 1); }
         } else if (T.blocks && c.blockCd <= 0 && !cornerNear && attackGap < 2.0f * cs.len) {
           c.blockT = 1.0f; c.blockCd = 5.0f;
@@ -405,6 +486,7 @@ static void updateCars(float dt, bool racing, bool coolDown) {
 
       // ── Longitudinal ──
       float accel = A_ACC * cs.acc * c.perf * (1.15f - 0.5f * c.v / (V_TOP * cs.top)) * wx * (c.surface == 1 ? 0.4f : (c.surface ? 0.6f : 1.0f));
+      accel *= 1.0f + TOW_ACC * c.tow * clampf(c.v / (V_TOP * cs.top), 0, 1);   // drag matters more the faster you go
       c.braking = vT < c.v - 2.0f;
       if (c.v < vT) c.v = fmn(vT, c.v + accel * dt);
       else {
@@ -534,7 +616,7 @@ static void updateCars(float dt, bool racing, bool coolDown) {
         rear.contactCd = front.contactCd = 4.0f;
         rear.v *= 0.85f; front.v *= 0.95f;
         bool rough = rear.trait == TR_AGGRESSIVE || front.trait == TR_DEFENSIVE;
-        if (frand() < (rough ? 0.30f : 0.12f)) {
+        if (frand() < (rough ? 0.22f : 0.08f)) {
 #ifdef RT_DEBUG_SPIN
           printf("  spin-contact %s by %s s=%.0f\n", front.code, rear.code, front.s);
 #endif
