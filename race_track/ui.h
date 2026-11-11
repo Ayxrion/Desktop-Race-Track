@@ -539,6 +539,47 @@ static uint16_t lbSw[MAX_CARS];
 static int      lbN = 0, lbCamC = -1;
 #define LB_SPR_H (LB_HEAD + MAX_CARS * LB_ROW + 34)
 
+// The sprite's text as runs of same-coloured pixels, rebuilt with the sprite.
+// Most of the sprite is transparent, so a frame only writes the text pixels
+// instead of unpacking ~20 KB of nibbles from PSRAM.
+struct LbRun { uint8_t x, len, c; };
+#define LB_MAX_RUNS 6000
+static LbRun*    lbRuns = nullptr;            // PSRAM
+static uint16_t* lbRowStart = nullptr;        // LB_SPR_H + 1 entries
+static bool      lbRunsOk = false;
+
+static void buildLbRuns() {
+  lbRunsOk = false;
+  if (!lb4) return;
+  if (!lbRuns) {
+    lbRuns = (LbRun*)heap_caps_malloc(sizeof(LbRun) * LB_MAX_RUNS, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    lbRowStart = (uint16_t*)heap_caps_malloc(sizeof(uint16_t) * (LB_SPR_H + 1), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!lbRuns || !lbRowStart) return;
+  }
+  const uint8_t* src = (const uint8_t*)lbSpr.getBuffer();
+  const int sh = lbHiFirst ? 4 : 0, sl = lbHiFirst ? 0 : 4;
+  int n = 0;
+  for (int y = 0; y < LB_SPR_H; ++y) {
+    lbRowStart[y] = (uint16_t)n;
+    const uint8_t* s = src + y * lbStride;
+    int x = 0;
+    while (x < LB_W) {
+      uint8_t v = s[x >> 1], c = (x & 1) ? ((v >> sl) & 15) : ((v >> sh) & 15);
+      if (!c) { ++x; continue; }
+      int x0 = x;
+      while (x < LB_W) {
+        uint8_t v2 = s[x >> 1], c2 = (x & 1) ? ((v2 >> sl) & 15) : ((v2 >> sh) & 15);
+        if (c2 != c) break;
+        ++x;
+      }
+      if (n >= LB_MAX_RUNS) return;                       // too busy: keep the nibble path
+      lbRuns[n++] = { (uint8_t)x0, (uint8_t)(x - x0), c };
+    }
+  }
+  lbRowStart[LB_SPR_H] = (uint16_t)n;
+  lbRunsOk = true;
+}
+
 static void lbText(const char* s, int x, int y, uint8_t c, const lgfx::IFont* font, textdatum_t datum) {
   lbSpr.setFont(font); lbSpr.setTextDatum(datum);
   if (lb4) lbSpr.setTextColor((uint32_t)c); else lbSpr.setTextColor(LB_PAL[c]);
@@ -628,6 +669,7 @@ static void rebuildLeaderboard() {
   lbH = ly + 9;
   lbBuiltMs = millis();
   lbDirty = true;
+  buildLbRuns();
 }
 
 // ─── Per-frame UI snapshot (taken before the sim runs ahead on core 0) ────────
@@ -658,7 +700,16 @@ static void drawLeaderboard() {
     for (int r = yy - 4; r < yy + 5; ++r) if (r >= clipY0 && r < clipY1) { uint16_t* p = fb + r * SCREEN_W + LB_X + 22; p[0] = p[1] = p[2] = lbSw[k]; }
   }
   int y0 = clipY0 > LB_Y ? clipY0 : LB_Y, y1 = clipY1 < LB_Y + lbH ? clipY1 : LB_Y + lbH;
-  if (lb4) {
+  if (lb4 && lbRunsOk) {
+    for (int y = y0; y < y1; ++y) {
+      uint16_t* d = fb + y * SCREEN_W + LB_X;
+      for (int k = lbRowStart[y - LB_Y], e = lbRowStart[y - LB_Y + 1]; k < e; ++k) {
+        const LbRun r = lbRuns[k];
+        const uint16_t c = lbPal565[r.c];
+        for (int i = 0; i < r.len; ++i) d[r.x + i] = c;
+      }
+    }
+  } else if (lb4) {
     const uint8_t* src = (const uint8_t*)lbSpr.getBuffer();
     const int sh = lbHiFirst ? 4 : 0, sl = lbHiFirst ? 0 : 4;
     for (int y = y0; y < y1; ++y) {

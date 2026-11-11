@@ -13,13 +13,18 @@ It uses the same board setup and rendering approach as the koi pond (Desktop Aqu
 - **Series**: Formula (open-wheelers in team pairs), GT, Touring, Endurance (prototypes and GTs together) and Classic (1960s cigar-shaped cars in national colours).
 - **AI drivers** steer like real cars. Each car has a position, heading and speed, and a path-tracking controller follows the line it wants: the racing line, or an offset line when passing or defending.
   Cornering is limited by tyre grip, so a car that arrives too fast slides wide, scrubs speed, and can end up on the grass, in the gravel, in the wall, or spinning.
-  Drivers plan their own braking points, slipstream, pick the inside or outside to pass, race side by side, and sometimes make contact.
-- **Driver traits**, shown as a coloured dot on the leaderboard and named in the tag of the car you're following:
-  - **Aggressive** (red): carries the most speed into corners, brakes latest, attacks even into corners, and needs the least room. They're fastest, but they make the most mistakes, end up in the gravel or the wall, and cause contact.
+  Drivers plan their own braking points, pick the inside or outside to pass, race side by side, and sometimes make contact.
+- **Close racing**: within about a second of the car ahead on a straight, a driver gets a tow that adds acceleration and top speed.
+  A driver committed to a move brakes later into the next corner, and once their nose is alongside on the inside, the other car usually gives way.
+  A leader with a cushion manages the gap, and every driver's form drifts a little over a race, so gaps open and close.
+  A car with someone right behind is more likely to make a mistake.
+- **Driver traits**, shown as a coloured dot on the leaderboard and named in the tag of the car you're following.
+  They change how someone races more than how fast they are, so any trait can win:
+  - **Aggressive** (red): a touch more speed into corners and later braking, dives up the inside even mid-corner, and needs the least room. They make the most mistakes and visit the gravel most.
   - **Balanced** (no dot): the baseline.
-  - **Cautious** (blue): a little off the limit, with clean lines, and passes only on straights with a clear advantage.
-  - **Patient** (green): takes it easy, rarely attacks, keeps a big gap, and waves faster cars through.
-  - **Defensive** (orange): covers the inside when someone attacks.
+  - **Cautious** (blue): slightly off the limit with clean lines, and needs a clearer advantage before passing.
+  - **Patient** (green): takes it a little easier, rarely attacks, keeps a bigger gap, and waves clearly faster cars through.
+  - **Defensive** (orange): covers the inside when someone attacks, and won't give way when a car gets alongside.
   Every driver also lets cars that are lapping them through (blue flags).
 - **Race weekend loop**: cars form up on the grid behind the start lights, race for the set number of laps, and take the chequered flag.
   The podium is shown, and then the next circuit is built.
@@ -114,9 +119,14 @@ On top of that:
 
 - **The race simulation runs on core 0**, in parallel with rendering on core 1. Before each frame, core 1 snapshots what it draws: car poses, particles, the leaderboard and the ticker text. Then it kicks off the next simulation steps and renders the snapshot.
 - **A still camera only re-renders rows that change.** The whole-track view and the grandstand-corner shots only redraw the rows touched by cars, particles or changing UI, this frame or last. Everything else stays on the panel. The TV camera snaps exactly onto its target when it settles, so it really is still.
-- **The leaderboard is a cached 4-bit sprite.** It's rebuilt 4 times a second and copied into the strips. Car colour swatches are drawn directly.
+- **The leaderboard is a cached 4-bit sprite.** It's rebuilt 4 times a second, along with a list of its text pixels as same-colour runs, so each frame only writes those. Car colour swatches are drawn directly.
+- **Zoomed in, only the visible map columns are fetched.** A second copy of the full-size map is stored in 320-pixel-wide vertical bands, so a strip's prefetch is two or three contiguous blocks instead of whole 1600-byte rows. That cuts most of the PSRAM reads.
+- **The GDMA copies use 32-byte bursts** (the default is 16), and the rows aren't hashed when the camera moved, since every row changes anyway.
+- **Particles are projected once per frame** into a screen-space list with their lit colours, and each strip only draws the ones it overlaps.
+- **Translucent panels blend two pixels at a time** with shifts, for the alpha values where that's exact enough.
 
-On the device it runs at about 24–30 fps on the whole-track view (capped at 30) and 17–21 fps zoomed in, where PSRAM bandwidth is the limit because every row changes.
+On the device, with 20 cars, it runs at about 28–29 fps zoomed in (capped at 30) and 24–30 fps on the whole-track view.
+PSRAM bandwidth is still the limit when zoomed in, because every row changes.
 
 Track geometry works in track coordinates: *s* is the distance along the centreline, and *d* is the offset across it, positive to the driver's right.
 Every baked pixel finds its nearest centreline segment through a 4 px nearest-sample grid, and kerbs, run-off, barriers, pits and grandstands are all defined in (*s*, *d*).

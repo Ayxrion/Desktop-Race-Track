@@ -11,8 +11,13 @@ struct Particle { float x, y, vx, vy, r, grow; uint8_t type, life, maxLife; bool
 // Both arrays live in PSRAM (~5 KB each, so they stay in cache): internal RAM
 // is tight, and the TLS library (weather) allocates its buffers there.
 static Particle* parts  = nullptr;
-static Particle* partsR = nullptr;        // snapshot drawn by core 1 while the sim updates parts on core 0
-static void snapshotParticles() { memcpy(partsR, parts, sizeof(Particle) * MAX_PARTS); }
+
+// What core 1 draws: the on-screen particles, already in screen space with
+// their colours lit, built once per frame before the sim runs ahead on core 0.
+// Each strip then only touches the particles that overlap it.
+struct PDraw { int16_t sx, sy, y0, y1; uint8_t solid, r1, r2, a1, a2; uint32_t c1, c2; };
+static PDraw* pd  = nullptr;
+static int    pdN = 0;
 static int partCursor = 0;
 
 static void spawnParticle(uint8_t type, float x, float y, float vx, float vy, float r, float grow, int life) {
@@ -37,29 +42,46 @@ static void updateParticles() {
   }
 }
 
-static void IRAM_ATTR drawParticles() {
+static void snapshotParticles() {
   const float z = cam.zoom;
+  const uint32_t cDust = litT(0xC8B48Cu), cSmoke = litT(0xD8D8D8u), cSpray = litT(0xD8E0E8u), cGrass = litT(0x6A9A3Au);
+  pdN = 0;
   for (int i = 0; i < MAX_PARTS; ++i) {
-    const Particle& p = partsR[i];
-    if (!p.active) continue;
-    float R = p.r * z;
-    if (!worldVisible(p.x, p.y, p.r + 1)) continue;
-    int sx = (int)w2sx(p.x), sy = (int)w2sy(p.y);
-    float f = p.life / (float)p.maxLife;
+    const Particle& p = parts[i];
+    if (!p.active || !worldVisible(p.x, p.y, p.r + 1)) continue;
+    PDraw& q = pd[pdN];
+    q.sx = (int16_t)w2sx(p.x); q.sy = (int16_t)w2sy(p.y);
+    q.solid = 0; q.a2 = 0; q.r2 = 0; q.c2 = 0;
+    const float f = p.life / (float)p.maxLife;
+    const int R = (int)fmn(255.0f, fmx(1.0f, p.r * z));
     switch (p.type) {
-      case PT_DUST:  blendCircle(sx, sy, (int)fmx(1, R), litT(0xC8B48Cu), (uint32_t)(16 * f) + 1); break;
-      case PT_SMOKE: blendCircle(sx, sy, (int)fmx(1, R), litT(0xD8D8D8u), (uint32_t)(15 * f) + 1); break;
-      case PT_SPRAY: blendCircle(sx, sy, (int)fmx(1, R), litT(0xD8E0E8u), (uint32_t)(9 * f) + 1); break;
-      case PT_GRASS: blendCircle(sx, sy, (int)fmx(1, R), litT(0x6A9A3Au), (uint32_t)(22 * f) + 1); break;
+      case PT_DUST:  q.r1 = R; q.c1 = cDust;  q.a1 = (uint8_t)(16 * f) + 1; break;
+      case PT_SMOKE: q.r1 = R; q.c1 = cSmoke; q.a1 = (uint8_t)(15 * f) + 1; break;
+      case PT_SPRAY: q.r1 = R; q.c1 = cSpray; q.a1 = (uint8_t)(9 * f) + 1;  break;
+      case PT_GRASS: q.r1 = R; q.c1 = cGrass; q.a1 = (uint8_t)(22 * f) + 1; break;
       case PT_SPARK:
-        fCircle(sx, sy, (int)fmx(0, 0.6f * z), f > 0.5f ? 0xFFF0A0u : 0xFF9030u);
-        if (z > 1.2f) blendCircle(sx, sy, (int)(2 * z), 0xFFB040u, 10);
+        q.solid = 1; q.r1 = (uint8_t)fmx(0, 0.6f * z); q.c1 = f > 0.5f ? 0xFFF0A0u : 0xFF9030u; q.a1 = 32;
+        if (z > 1.2f) { q.r2 = (uint8_t)(2 * z); q.c2 = 0xFFB040u; q.a2 = 10; }
         break;
       case PT_FLASH:
-        blendCircle(sx, sy, (int)fmx(1, 1.4f * z), 0xFFFFFFu, 28);
-        if (z > 1.2f) blendCircle(sx, sy, (int)(3 * z), 0xFFFFFFu, 8);
+        q.r1 = (uint8_t)fmx(1, 1.4f * z); q.c1 = 0xFFFFFFu; q.a1 = 28;
+        if (z > 1.2f) { q.r2 = (uint8_t)(3 * z); q.c2 = 0xFFFFFFu; q.a2 = 8; }
         break;
+      default: continue;
     }
+    int rm = q.r1 > q.r2 ? q.r1 : q.r2;
+    q.y0 = (int16_t)(q.sy - rm - 1); q.y1 = (int16_t)(q.sy + rm + 1);
+    ++pdN;
+  }
+}
+
+static void IRAM_ATTR drawParticles() {
+  for (int i = 0; i < pdN; ++i) {
+    const PDraw& q = pd[i];
+    if (q.y1 < clipY0 || q.y0 >= clipY1) continue;
+    if (q.solid) fCircle(q.sx, q.sy, q.r1, q.c1);
+    else         blendCircle(q.sx, q.sy, q.r1, q.c1, q.a1);
+    if (q.a2) blendCircle(q.sx, q.sy, q.r2, q.c2, q.a2);
   }
 }
 
@@ -168,8 +190,9 @@ static void drawWeatherFx() {
 static void initEffects() {
   if (!parts) {
     parts  = (Particle*)heap_caps_malloc(sizeof(Particle) * MAX_PARTS, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    partsR = (Particle*)heap_caps_malloc(sizeof(Particle) * MAX_PARTS, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    pd     = (PDraw*)heap_caps_malloc(sizeof(PDraw) * MAX_PARTS, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   }
-  for (int i = 0; i < MAX_PARTS; ++i) parts[i].active = partsR[i].active = false;
+  for (int i = 0; i < MAX_PARTS; ++i) parts[i].active = false;
+  pdN = 0;
   numDrops = numFlakes = 0;
 }

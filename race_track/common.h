@@ -154,11 +154,32 @@ static inline uint32_t lit(uint32_t c) {
 }
 
 // ─── Direct canvas pixel ops (alpha blending, which LovyanGFX lacks) ─────────
+// Fast path for wide spans: when (32 - alpha) is a sum of at most two powers of
+// two (alpha 8, 12, 14..16, 20, 22..24, 26..31: the UI panels and most effects),
+// background × (32 - alpha) / 32 is one or two masked shifts, done two pixels
+// per 32-bit word; the colour's share is a constant per span. Channel sums
+// can't carry into each other (bg share + colour share ≤ full scale).
+static const uint32_t SHIFT_MASK2[6] = { 0, 0x7BEF7BEFu, 0x39E739E7u, 0x18E318E3u, 0x08610861u, 0x00200020u };
+static void IRAM_ATTR blendSpanShift(uint16_t* p, int n, uint16_t c, uint32_t a, uint32_t inv) {
+  int sA = 0, sB = 0;                                  // shifts for the (up to) two set bits of inv
+  for (int k = 4; k >= 0; --k) if (inv & (1u << k)) { if (!sA) sA = 5 - k; else sB = 5 - k; }
+  const uint32_t mA = SHIFT_MASK2[sA], mB = sB ? SHIFT_MASK2[sB] : 0;
+  uint32_t ct = ((((c >> 11) & 31) * a >> 5) << 11) | ((((c >> 5) & 63) * a >> 5) << 5) | ((c & 31) * a >> 5);
+  const uint32_t ct2 = ct | (ct << 16);
+  if ((uintptr_t)p & 2) { uint32_t w = *p; *p++ = (uint16_t)(((w >> sA) & mA) + ((w >> sB) & mB) + ct); --n; }
+  uint32_t* q = (uint32_t*)p;
+  for (int i = n >> 1; i > 0; --i, ++q) { uint32_t w = *q; *q = ((w >> sA) & mA) + ((w >> sB) & mB) + ct2; }
+  if (n & 1) { p = (uint16_t*)q; uint32_t w = *p; *p = (uint16_t)(((w >> sA) & mA) + ((w >> sB) & mB) + ct); }
+}
+
 static inline void blendSpan(int y, int x0, int x1, uint16_t c565, uint32_t a) {
   if (y < clipY0 || y >= clipY1) return;
   if (x0 < 0) x0 = 0;
   if (x1 > SCREEN_W - 1) x1 = SCREEN_W - 1;
+  if (x1 < x0) return;
   uint16_t* p = fb + y * SCREEN_W + x0;
+  const uint32_t inv = 32 - a;
+  if (x1 - x0 >= 7 && a < 32 && __builtin_popcount(inv) <= 2) { blendSpanShift(p, x1 - x0 + 1, c565, a, inv); return; }
   for (int x = x0; x <= x1; ++x, ++p) *p = toPx(blend565(c565, fromPx(*p), a));
 }
 

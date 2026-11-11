@@ -37,6 +37,13 @@ static inline uint8_t PI_(int g, int s) { return (uint8_t)((g << 4) | clampi(s, 
 
 static uint8_t*  worldIdx = nullptr;   // WORLD_W × WORLD_H palette indices (PSRAM)
 static uint8_t*  halfIdx  = nullptr;   // HALF_W  × HALF_H  (for zoomed-out views)
+// A copy of worldIdx in vertical bands BAND_W wide (band-major, each band's rows
+// contiguous). Zoomed in, only ~a quarter of each map row is on screen; with
+// bands, a strip's prefetch is a few contiguous blocks of just the visible
+// columns instead of whole 1600-byte rows, which saves most of the PSRAM reads.
+#define BAND_W   320
+#define N_BANDS  (WORLD_W / BAND_W)
+static uint8_t*  worldBand = nullptr;  // optional: without it, whole rows are fetched
 static uint16_t  pal565[256];
 static uint32_t  basePal[256];
 
@@ -75,6 +82,7 @@ static uint16_t* gD2  = nullptr;     // its squared distance
 static bool allocWorld() {
   worldIdx = (uint8_t*)heap_caps_aligned_alloc(64, WORLD_W * WORLD_H, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   halfIdx  = (uint8_t*)heap_caps_aligned_alloc(64, HALF_W * HALF_H,   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  worldBand = (uint8_t*)heap_caps_aligned_alloc(64, WORLD_W * WORLD_H, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   gIdx     = (uint16_t*)heap_caps_malloc(G_W * G_H * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   gD2      = (uint16_t*)heap_caps_malloc(G_W * G_H * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   return worldIdx && halfIdx && gIdx && gD2 && allocTrack();
@@ -408,6 +416,7 @@ static void placeTrees(ProgressFn progress) {
 #define SRC_STRIDE 864
 #define SRC_BYTES  (SRC_ROWS * SRC_STRIDE)
 static uint8_t*              srcBuf = nullptr;
+static uint32_t              bgWaitUs = 0;      // profiling: time spent waiting for the prefetch
 static async_memcpy_handle_t srcDma = nullptr;
 static SemaphoreHandle_t     srcReady = nullptr;
 static bool                  srcDmaOk = false, srcPending = false;
@@ -424,7 +433,8 @@ static bool flushMaps() {
   const int fl = ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED;
   esp_err_t e1 = esp_cache_msync(worldIdx, WORLD_W * WORLD_H, fl);
   esp_err_t e2 = esp_cache_msync(halfIdx, HALF_W * HALF_H, fl);
-  return e1 == ESP_OK && e2 == ESP_OK;
+  esp_err_t e3 = worldBand ? esp_cache_msync(worldBand, WORLD_W * WORLD_H, fl) : ESP_OK;
+  return e1 == ESP_OK && e2 == ESP_OK && e3 == ESP_OK;
 }
 
 static void initBgPrefetch() {
@@ -432,9 +442,11 @@ static void initBgPrefetch() {
   srcReady = xSemaphoreCreateBinary();
   async_memcpy_config_t cfg = ASYNC_MEMCPY_DEFAULT_CONFIG();
   cfg.backlog = SRC_ROWS + 2;
+  cfg.dma_burst_size = 32;                 // map rows are 800/1600 B from 64-aligned maps
   esp_err_t e3 = (srcBuf && srcReady) ? esp_async_memcpy_install(&cfg, &srcDma) : ESP_ERR_NO_MEM;
+  if (e3 != ESP_OK && srcBuf && srcReady) { cfg.dma_burst_size = 16; e3 = esp_async_memcpy_install(&cfg, &srcDma); }
   srcDmaOk = (e3 == ESP_OK);
-  Serial.printf("BG prefetch: %s (install %s)\n", srcDmaOk ? "GDMA" : "direct PSRAM reads", esp_err_to_name(e3));
+  Serial.printf("BG prefetch: %s, burst %u (install %s)\n", srcDmaOk ? "GDMA" : "direct PSRAM reads", (unsigned)cfg.dma_burst_size, esp_err_to_name(e3));
 }
 
 // ─── Generation entry point ───────────────────────────────────────────────────
@@ -455,6 +467,10 @@ static void generateWorld(int sel, uint32_t seed, ProgressFn progress) {
     uint8_t* d = halfIdx + y * HALF_W;
     for (int x = 0; x < HALF_W; ++x) d[x] = s0[x * 2 + (y & 1)];
   }
+  if (worldBand)
+    for (int b = 0; b < N_BANDS; ++b)
+      for (int y = 0; y < WORLD_H; ++y)
+        memcpy(worldBand + ((size_t)b * WORLD_H + y) * BAND_W, worldIdx + (size_t)y * WORLD_W + b * BAND_W, BAND_W);
   bool ok = flushMaps();
   if (!ok && srcDmaOk) { Serial.println("gen: cache sync failed - using direct PSRAM reads"); srcDmaOk = false; }
   Serial.printf("gen: trees+half %lu ms\n", (unsigned long)(millis() - t0));
@@ -565,7 +581,8 @@ static uint32_t IRAM_ATTR sceneryRgb(float wx, float wy) {
 
 // ─── Background render (scaled, palette-mapped) — as in the koi pond ─────────
 static int16_t _xmap[SCREEN_W];
-static struct { const uint8_t* src; int sw, sh; float inv, y0; bool identity; int xoff; } _bg;
+static int16_t _xoff[SCREEN_W];          // banded prefetch: offset of each screen column's source pixel within a row
+static struct { const uint8_t* src; int sw, sh; float inv, y0; bool identity; int xoff; bool banded; int b0, nb, slotRows; } _bg;
 
 static inline int bgRowFor(int sy) { return clampi((int)(_bg.y0 + (sy + 0.5f) * _bg.inv), 0, _bg.sh - 1); }
 
@@ -576,6 +593,23 @@ static void prefetchStrip(int y, int h = -1) {
   int yEnd = (y + h < SCREEN_H ? y + h : SCREEN_H) - 1;
   int ry0 = bgRowFor(y), ry1 = bgRowFor(yEnd);
   int n = ry1 - ry0 + 1;
+  if (_bg.banded) {
+    if (n > _bg.slotRows) return;
+    xSemaphoreTake(srcReady, 0);
+    for (int j = 0; j < _bg.nb; ++j) {                // one block per band; only the last signals
+      esp_err_t e = esp_async_memcpy(srcDma, srcBuf + (size_t)j * _bg.slotRows * BAND_W,
+                                     worldBand + ((size_t)(_bg.b0 + j) * WORLD_H + ry0) * BAND_W, (size_t)n * BAND_W,
+                                     j == _bg.nb - 1 ? _srcCopied : nullptr, nullptr);
+      if (e != ESP_OK) {
+        Serial.printf("BG prefetch failed (%s) - using direct PSRAM reads\n", esp_err_to_name(e));
+        srcDmaOk = false;
+        return;
+      }
+    }
+    srcRy0 = ry0;
+    srcPending = true;
+    return;
+  }
   if ((size_t)n * _bg.sw > SRC_BYTES) return;
   xSemaphoreTake(srcReady, 0);
   srcStride = _bg.sw; srcX0 = 0;
@@ -602,6 +636,17 @@ static void prepareBackground() {
   _bg.identity = fabsf(_bg.inv - 1.0f) < 1e-4f;
   _bg.xoff = _xmap[0];
   int maxRows = (int)(SRC_BYTES / _bg.sw);
+  _bg.banded = false;
+  if (!useHalf && worldBand && srcDmaOk) {
+    const int b0 = _xmap[0] / BAND_W, nb = _xmap[SCREEN_W - 1] / BAND_W - b0 + 1;
+    const int slotRows = (int)(SRC_BYTES / ((size_t)nb * BAND_W)) < SRC_ROWS ? (int)(SRC_BYTES / ((size_t)nb * BAND_W)) : SRC_ROWS;
+    if (nb < N_BANDS && slotRows >= 8) {              // worth it unless (nearly) every band is visible
+      _bg.banded = true; _bg.b0 = b0; _bg.nb = nb; _bg.slotRows = slotRows;
+      for (int sx = 0; sx < SCREEN_W; ++sx)
+        _xoff[sx] = (int16_t)((_xmap[sx] / BAND_W - b0) * slotRows * BAND_W + _xmap[sx] % BAND_W);
+      maxRows = slotRows;
+    }
+  }
   int h = (int)((maxRows - 2) / _bg.inv) + 1;
   stripH = clampi(h, 8, STRIP_H);
 }
@@ -611,7 +656,9 @@ static void IRAM_ATTR renderBackground() {
   const int sw = _bg.sw, sh = _bg.sh, xoff = _bg.xoff;
   const float inv = _bg.inv, y0 = _bg.y0;
   const bool identity = _bg.identity;
+  uint32_t _tw = micros();
   bool fromSram = srcPending && xSemaphoreTake(srcReady, pdMS_TO_TICKS(30)) == pdTRUE;
+  bgWaitUs += micros() - _tw;
   srcPending = false;
   int prevRy = -1;
   for (int sy = clipY0; sy < clipY1; ++sy) {
@@ -619,8 +666,14 @@ static void IRAM_ATTR renderBackground() {
     uint16_t* d = fb + sy * SCREEN_W;
     if (ry == prevRy) { memcpy(d, d - SCREEN_W, SCREEN_W * 2); continue; }
     prevRy = ry;
-    const uint8_t* row = fromSram ? srcBuf + (ry - srcRy0) * srcStride - srcX0 : src + ry * sw;
     uint32_t* d32 = (uint32_t*)d;
+    if (fromSram && _bg.banded) {
+      const uint8_t* base = srcBuf + (ry - srcRy0) * BAND_W;
+      for (int i = 0; i < SCREEN_W / 2; ++i)
+        d32[i] = pal565[base[_xoff[2 * i]]] | ((uint32_t)pal565[base[_xoff[2 * i + 1]]] << 16);
+      continue;
+    }
+    const uint8_t* row = fromSram ? srcBuf + (ry - srcRy0) * srcStride - srcX0 : src + ry * sw;
     if (identity) {
       const uint8_t* r = row + xoff;
       if (((uintptr_t)r & 3) == 0) {

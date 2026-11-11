@@ -40,18 +40,32 @@ static void initPresenter() {
   bool contiguous = fbBase && display.frameLine(1) == fbBase + SCREEN_W * 2 &&
                     display.frameLine(SCREEN_H - 1) == fbBase + (SCREEN_H - 1) * SCREEN_W * 2;
   bool aligned = ((uintptr_t)fbBase & 31) == 0;
+  // Bigger bursts use the (saturated) PSRAM bus much better than the default 16 B.
+  // Strip rows are 1600 B and 64-byte aligned, so the biggest burst the
+  // framebuffer's own alignment allows is used.
   async_memcpy_config_t cfg = ASYNC_MEMCPY_DEFAULT_CONFIG();
   cfg.backlog = 4;
-  esp_err_t e = (contiguous && aligned) ? esp_async_memcpy_install(&cfg, &dmaH) : ESP_ERR_INVALID_STATE;
+  esp_err_t e = ESP_ERR_INVALID_STATE;
+  if (contiguous && aligned) {
+    static const size_t BURSTS[3] = { 64, 32, 16 };
+    for (int i = 0; i < 3 && e != ESP_OK; ++i) {
+      if (((uintptr_t)fbBase & (BURSTS[i] - 1)) != 0) continue;     // the framebuffer must be burst-aligned
+      cfg.dma_burst_size = BURSTS[i];
+      e = esp_async_memcpy_install(&cfg, &dmaH);
+    }
+  }
   useDma = (e == ESP_OK);
-  Serial.printf("Presenter: fb %p contiguous %d aligned %d -> %s (%s)\n", fbBase, contiguous, aligned,
-                useDma ? "GDMA" : "CPU copy", esp_err_to_name(e));
+  Serial.printf("Presenter: fb %p contiguous %d aligned %d -> %s, burst %u (%s)\n", fbBase, contiguous, aligned,
+                useDma ? "GDMA" : "CPU copy", (unsigned)cfg.dma_burst_size, esp_err_to_name(e));
 }
 
 // ─── Dirty-row tracking ───────────────────────────────────────────────────────
 static uint32_t rowHash[SCREEN_H];
 static bool     rowHashValid = false;
 static uint32_t rowsCopied = 0;
+// Profiling (printed as "detail" every 5 s): row hashing, waiting for a strip's
+// GDMA copy to finish, and issuing the next strip's map prefetch.
+static uint32_t hashUs = 0, dmaWaitUs = 0, prefUs = 0;
 
 static inline uint32_t hashRow(const uint32_t* p) {
   uint32_t h = 0x9E3779B9u;
@@ -61,16 +75,21 @@ static inline uint32_t hashRow(const uint32_t* p) {
     h = ((h << 5) | (h >> 27)) ^ p[i + 2];
     h = ((h << 5) | (h >> 27)) ^ p[i + 3];
   }
-  return h;
+  return h | 1;                 // never 0: 0 marks a row whose panel content isn't hashed
 }
 
-static void presentStrip(int b, int y, int hh) {
+// full: every row of the frame is being redrawn (the camera moved), so hashing
+// can't save a copy; skip it and mark those rows unknown.
+static void presentStrip(int b, int y, int hh, bool full) {
   int first = -1, last = -1;
+  uint32_t _th = micros();
   int h = (y + hh < SCREEN_H ? y + hh : SCREEN_H) - y;
+  if (full) { memset(rowHash + y, 0, h * sizeof(uint32_t)); first = 0; last = h - 1; h = 0; }
   for (int i = 0; i < h; ++i) {
     uint32_t hh = hashRow((const uint32_t*)(stripBufs[b] + i * SCREEN_W));
     if (!rowHashValid || hh != rowHash[y + i]) { if (first < 0) first = i; last = i; rowHash[y + i] = hh; }
   }
+  hashUs += micros() - _th;
   if (first < 0) return;
   int n = last - first + 1;
   rowsCopied += n;
@@ -88,7 +107,9 @@ static void presentStrip(int b, int y, int hh) {
 
 static void waitStripFree(int b) {
   if (!useDma) return;
+  uint32_t _t = micros();
   xSemaphoreTake(stripFree[b], portMAX_DELAY);
+  dmaWaitUs += micros() - _t;
   xSemaphoreGive(stripFree[b]);
 }
 
@@ -209,7 +230,7 @@ void setup() {
 // ─── Simulation on core 0 ─────────────────────────────────────────────────────
 // The race simulation runs on core 0 (otherwise only WiFi and touch live there)
 // while core 1 renders the previous state from a snapshot: car poses (cdraw),
-// particles (partsR), the leaderboard sprite and the event text are all copied
+// particles (the pd draw list), the leaderboard sprite and the event text are all copied
 // before the sim is kicked. Everything that touches the camera or UI stays on
 // core 1 and only runs while the sim is idle.
 static SemaphoreHandle_t simKick = nullptr, simDone = nullptr;
@@ -253,13 +274,7 @@ static void markRows(int y0, int y1) {
 static void markDynamicRows() {
   memset(dynNow, 0, sizeof(dynNow));
   for (int i = 0; i < numCars; ++i) if (cdraw[i].vis) markRows(cdraw[i].y0, cdraw[i].y1);
-  const float z = cam.zoom;
-  for (int i = 0; i < MAX_PARTS; ++i) {
-    const Particle& p = partsR[i];
-    if (!p.active) continue;
-    float sy = w2sy(p.y), r = p.r * z + 3.0f * (z > 1.2f ? z : 1.0f) + 2.0f;
-    markRows((int)(sy - r), (int)(sy + r));
-  }
+  for (int i = 0; i < pdN; ++i) markRows(pd[i].y0 - 2, pd[i].y1 + 2);
   uiDynamicRows(markRows);
 }
 
@@ -332,7 +347,11 @@ void loop() {
     PROF(8);
     beginStrip(y, b, h);
     renderBackground();
-    if (k + 1 < nChunks) prefetchStrip(chunks[k + 1].y, chunks[k + 1].h);
+    if (k + 1 < nChunks) {
+      uint32_t tp = micros();
+      prefetchStrip(chunks[k + 1].y, chunks[k + 1].h);
+      prefUs += micros() - tp;
+    }
     PROF(2);
     drawCarShadows();
     drawHeadlights();
@@ -345,7 +364,7 @@ void loop() {
     PROF(6);
     drawUI();
     PROF(7);
-    presentStrip(b, y, h);
+    presentStrip(b, y, h, full);
     rowsRendered += h;
     PROF(8);
   }
@@ -366,6 +385,8 @@ void loop() {
     Serial.print("  ui:");
     for (int i = 0; i < 8; ++i) { Serial.printf(" %.1f", uiProf[i] / 1000.0f / fpsFrames); uiProf[i] = 0; }
     Serial.println();
+    Serial.printf("  detail: bgWait %.1f hash %.1f dmaWait %.1f pref %.1f\n", bgWaitUs / 1000.0f / fpsFrames, hashUs / 1000.0f / fpsFrames, dmaWaitUs / 1000.0f / fpsFrames, prefUs / 1000.0f / fpsFrames);
+    bgWaitUs = hashUs = dmaWaitUs = prefUs = 0;
     Serial.printf("  rows rendered/frame: %u, copied: %u of %d\n", (unsigned)(rowsRendered / fpsFrames),
                   (unsigned)(rowsCopied / fpsFrames), SCREEN_H);
     rowsCopied = rowsRendered = 0;
