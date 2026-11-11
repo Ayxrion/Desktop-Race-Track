@@ -10,10 +10,13 @@ It uses the same board setup and rendering approach as the koi pond (Desktop Aqu
   The presets are Monza, Spa-Francorchamps, Silverstone, Interlagos, Red Bull Ring, Circuit of the Americas, Zandvoort, Hungaroring, Watkins Glen, Imola and Road America.
   By default the device alternates between a preset and a new random circuit for each race.
 - **Trackside**: red and white kerbs, gravel traps and tarmac run-off sized to each corner, armco and tyre walls, a pit lane with garages and a paddock, grandstands with crowds on the slowest corners, and forests and fields around the outside.
-- **Series**: Formula (open-wheelers in team pairs), GT, Touring, Endurance (prototypes and GTs together) and Classic (1960s cigar-shaped cars in national colours).
+- **Car types**: Formula (open-wheelers in team pairs), GT, Touring, Endurance (prototypes and GTs together), Classic (1960s cigar-shaped cars in national colours) and Vans (boxy panel vans: slow out of corners, short on grip).
+  Pick one in settings, or leave it on Random.
 - **AI drivers** steer like real cars. Each car has a position, heading and speed, and a path-tracking controller follows the line it wants: the racing line, or an offset line when passing or defending.
   Cornering is limited by tyre grip, so a car that arrives too fast slides wide, scrubs speed, and can end up on the grass, in the gravel, in the wall, or spinning.
   Drivers plan their own braking points, pick the inside or outside to pass, race side by side, and sometimes make contact.
+  They leave racing room for a car alongside instead of steering into it, pick the side that stays open along the next stretch, and back out of a move that's being closed down.
+  Lane changes ease in, so a car settles onto its new line instead of running wide onto the grass.
 - **Close racing**: within about a second of the car ahead on a straight, a driver gets a tow that adds acceleration and top speed.
   A driver committed to a move brakes later into the next corner, and once their nose is alongside on the inside, the other car usually gives way.
   A leader with a cushion manages the gap, and every driver's form drifts a little over a race, so gaps open and close.
@@ -43,7 +46,7 @@ It uses the same board setup and rendering approach as the koi pond (Desktop Aqu
 | Pinch, or **−** / **+** | Zoom between the whole track (0.5×) and close-up (2.5×) |
 | ☰ (list) | Show or hide the leaderboard |
 | 📺 (TV) | Spectator mode on or off |
-| ⚙ (gear) | Settings: brightness, weather (Auto or forced), time (Real / Fast / Day / Night), number of cars, track (Rotate / Random / a preset), race length, series, camera, spectator, and *Next race now* (tap twice) |
+| ⚙ (gear) | Settings: brightness, weather (Auto or forced), time (Real / Fast / Day / Night), number of cars, track (Rotate / Random / a preset), car type (Random or one series), race length, camera, spectator, **Drivers**, and *Next race now* (tap twice) |
 | *(no touch for 30 s)* | The **TV camera** takes over again |
 
 **Camera** (in settings) picks what the TV camera shows:
@@ -60,7 +63,12 @@ Dragging, pinching, tapping cars and the zoom buttons are ignored, while the lea
 With spectator off, touching the track takes the camera over, and the TV camera comes back after 30 s without touch.
 Pressing buttons or changing settings doesn't stop the TV camera either way.
 
-Settings are saved to flash (NVS). Car count, track and series take effect at the next race. Race length applies right away.
+Settings are saved to flash (NVS). Car count, track, car type and drivers take effect at the next race. Race length applies right away.
+
+**Drivers** (in settings) lists 20 driver slots.
+Turn *Custom* on and car 1 gets slot 1's name and trait, car 2 slot 2's, and so on; turn it off for random drivers each race.
+Tap a name to type a new one (up to 3 letters or digits), tap a trait to cycle through Balanced, Cautious, Patient, Defensive and Aggressive, and *Copy this race* fills the slots from the field that's racing now.
+Slots past the number of cars sit out.
 
 ## Building (Arduino IDE)
 

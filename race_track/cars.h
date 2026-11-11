@@ -17,7 +17,7 @@
 
 #include "effects.h"
 
-enum CarClass : uint8_t { CC_FORMULA, CC_PROTO, CC_GT, CC_TOURING, CC_CLASSIC, CC_COUNT };
+enum CarClass : uint8_t { CC_FORMULA, CC_PROTO, CC_GT, CC_TOURING, CC_CLASSIC, CC_VAN, CC_COUNT };
 struct ClassSpec { const char* name; float len, wid, top, grip, acc; };
 static const ClassSpec CLS[CC_COUNT] = {
   { "Formula",   14.0f, 5.8f, 1.00f, 1.00f, 1.00f },
@@ -25,10 +25,11 @@ static const ClassSpec CLS[CC_COUNT] = {
   { "GT",        13.5f, 6.2f, 0.88f, 0.82f, 0.80f },
   { "Touring",   12.5f, 5.8f, 0.82f, 0.78f, 0.76f },
   { "Classic",   12.5f, 4.8f, 0.80f, 0.70f, 0.74f },
+  { "Van",       14.5f, 6.8f, 0.74f, 0.68f, 0.62f },   // tall and heavy: slow out of corners, leans on the tyres
 };
 
-enum Series : uint8_t { SER_FORMULA, SER_GT, SER_TOURING, SER_ENDURANCE, SER_CLASSIC, SER_COUNT };
-static const char* const SERIES_NAMES[SER_COUNT] = { "Formula", "GT", "Touring", "Endurance", "Classic" };
+enum Series : uint8_t { SER_FORMULA, SER_GT, SER_TOURING, SER_ENDURANCE, SER_CLASSIC, SER_VANS, SER_COUNT };
+static const char* const SERIES_NAMES[SER_COUNT] = { "Formula", "GT", "Touring", "Endurance", "Classic", "Vans" };
 
 // ─── Driver traits ────────────────────────────────────────────────────────────
 enum Trait : uint8_t { TR_AGGRESSIVE, TR_BALANCED, TR_CAUTIOUS, TR_PATIENT, TR_DEFENSIVE, TR_COUNT };
@@ -82,6 +83,7 @@ struct Car {
   float concedeT;           // > 0: giving the corner to a car alongside on the inside
   float react;              // start reaction delay (s)
   float passT; int8_t passSide; int8_t passCar;
+  float passCd;             // > 0: just backed out of a move; wait before trying again
   float blockT, blockCd, yieldT; int8_t yieldSide;
   float lockT, contactCd, recoverT;
   float stopT;
@@ -121,6 +123,12 @@ static const char* const DRIVER_CODES[] = {
   "PAL", "QAS", "REN", "SKO", "TAV", "ULM", "VDB", "WEX", "YAM", "ZEL", "BRO", "CAL", "DUN", "FIN", "KEL",
   "MIR", "NOV", "OST", "RAD", "SOL", "TOR", "VAN", "WIL", "ACH", "BAK" };
 #define NUM_CODES ((int)(sizeof(DRIVER_CODES) / sizeof(DRIVER_CODES[0])))
+
+// Custom drivers (Settings → Drivers). When on, car i gets slot i's name and
+// trait instead of random ones. Saved in NVS by settings.h.
+static bool    customDrivers = false;
+static char    customCode[MAX_CARS][4];
+static uint8_t customTrait[MAX_CARS];
 
 static const uint32_t TEAM_COLS[][3] = {
   { 0xD8202Au, 0xF0F0F0u, 0xF0D020u }, { 0x1E3A8Au, 0xF0C020u, 0xE02020u }, { 0x0A7A5Au, 0xE8E8E8u, 0x40E0B0u },
@@ -178,6 +186,7 @@ static void setupCars(int n, uint8_t series, uint32_t seed) {
       case SER_GT:        c.cls = CC_GT; break;
       case SER_TOURING:   c.cls = CC_TOURING; break;
       case SER_CLASSIC:   c.cls = CC_CLASSIC; break;
+      case SER_VANS:      c.cls = CC_VAN; break;
       case SER_ENDURANCE: c.cls = (i < (numCars + 2) / 3) ? CC_PROTO : CC_GT; break;
       default:            c.cls = CC_FORMULA; break;
     }
@@ -195,6 +204,10 @@ static void setupCars(int n, uint8_t series, uint32_t seed) {
     memcpy(c.code, DRIVER_CODES[codes[i % NUM_CODES]], 3); c.code[3] = 0;
     c.num = (uint8_t)irandr(1, 99);
     c.trait = pickTrait();
+    if (customDrivers) {      // the user's own field (the random draws above still happen, so nothing else changes)
+      if (customCode[i][0]) { memcpy(c.code, customCode[i], 4); c.code[3] = 0; }
+      c.trait = customTrait[i] < TR_COUNT ? customTrait[i] : (uint8_t)TR_BALANCED;
+    }
     c.perf = frandr(0.988f, 1.0f);
     c.skill = frandr(0.86f, 0.99f);
     c.react = frandr(0.05f, 0.45f) * (c.trait == TR_AGGRESSIVE ? 0.7f : (c.trait == TR_PATIENT ? 1.3f : 1.0f));
@@ -243,7 +256,11 @@ static void setupCars(int n, uint8_t series, uint32_t seed) {
 #define PASS_T         0.35f    // s: a balanced driver goes for it from this far back
 #define ATTACK_COMMIT  1.015f   // how much later anyone brakes into a corner when going for a pass
 #define DIVE_BRAKE     1.15f    // braking a driver dares while committed to a pass (×, within the car's limit)
-#define ATTACK_LINE    0.4f     // off-line cornering penalty while committed to a pass (×)
+#define PASS_EDGE      0.0f     // px past the clean-track limit a passing lane may use
+#define LANE_EASE      3.0f     // 1/s: lane changes slow down as they reach the new line
+#define PASS_RETRY     1.0f     // s to wait after backing out of a move
+#define RACE_ROOM      1.6f     // px of gap left to a car alongside...
+#define RACE_ROOM_TIGHT 0.8f    // ...or less by aggressive and defensive drivers
 #define OVERLAP_NEED   0.5f     // car lengths of overlap needed on the inside before the other car gives way
 #define CONCEDE        0.96f    // a car giving the corner lifts this much (×)
 #define YIELD_DV       6.0f     // px/s: how much quicker a car must be before a patient driver waves it by
@@ -360,13 +377,24 @@ static void updateCars(float dt, bool racing, bool coolDown) {
       const float fm = 1.0f + c.form - ease;
       float vT = V_TOP * cs.top * c.perf * T.straight * fm;
       const float sg = sqrtf(gT);
+      // Off the racing line (passing, defending, side by side) the car is on a
+      // parallel line, tighter on the inside of a corner, so it can carry less
+      // speed there: curvature of a line offset by o from one of curvature k is
+      // k / (1 - k·o). Drivers take that into account (aggressive ones only partly).
+      const float off0 = c.dPath - f.rl;
+      const bool  offLine = fabsf(off0) > 1.5f;
+      const float aware = fmn(1.0f, T.lineAware + 0.3f);
       for (float u = 0; u <= 180.0f; u += 10.0f) {
-        float vc = tp[idxAt(c.s + u)].vc * sg * fm;
+        const TrackPt& P = tp[idxAt(c.s + u)];
+        float vc = P.vc * sg * fm;
+        if (offLine && fabsf(P.rk) > 1e-5f) {
+          float kp = P.rk / fmx(0.3f, 1.0f - P.rk * off0);
+          float ratio = fmn(1.0f, sqrtf(fabsf(P.rk) / fmx(fabsf(kp), 1e-6f)));
+          vc *= 1.0f - aware * (1.0f - ratio);
+        }
         float lim = vc * vc + 2.0f * ab * u;
         if (lim < vT * vT) vT = sqrtf(lim);
       }
-      float off = clampf(fabsf(c.dPath - f.rl) / hw, 0, 1);
-      vT *= 1.0f - 0.12f * T.lineAware * (c.passT > 0 ? ATTACK_LINE : 1.0f) * off * clampf(fabsf(f.k) * 80.0f, 0, 1);
       if (c.concedeT > 0) { c.concedeT -= dt; vT *= CONCEDE; }
       if (coolDown || c.finished) vT *= 0.6f;
       if (c.recoverT > 0) { c.recoverT -= dt; vT = fmn(vT, 45.0f); }
@@ -418,10 +446,15 @@ static void updateCars(float dt, bool racing, bool coolDown) {
         bool faster = (vFree > a.v + T.passMargin && (aAtSpeed || dive)) || a.state != CS_RACE || (lapping && vFree > a.v);
         bool allowed = T.cornerAttack || !cornerNear || a.state != CS_RACE || lapping;
         const float passWin = fmx(T.passGap * lenAvg, c.v * PASS_T * (T.passGap / 3.0f));
-        if (c.passT <= 0 && faster && allowed && gap < passWin && racing && !coolDown) {
-          const float hwP = hwC + 1.8f;            // may use the kerbs
-          float roomR = hwP - (a.d + widAvg + 1.2f) - T.passRoom;
-          float roomL = (a.d - widAvg - 1.2f) + hwP - T.passRoom;
+        if (c.passT <= 0 && c.passCd <= 0 && faster && allowed && gap < passWin && racing && !coolDown) {
+          const float hwP = hwC + PASS_EDGE;       // stays on the track proper
+          // room either side of them, now and where their line takes them next
+          float roomR = 1e9f, roomL = 1e9f;
+          for (float u = 0; u <= 75.0f; u += 25.0f) {
+            float ad = u == 0 ? a.d : tp[idxAt(a.s + u)].rl;
+            roomR = fmn(roomR, hwP - (ad + widAvg + 1.2f) - T.passRoom);
+            roomL = fmn(roomL, (ad - widAvg - 1.2f) + hwP - T.passRoom);
+          }
           if (roomR > 0 || roomL > 0) {
             // prefer the inside of the next corner if there's room there
             float kN = tp[idxAt(c.s + 50.0f)].k;
@@ -439,13 +472,14 @@ static void updateCars(float dt, bool racing, bool coolDown) {
       if (c.passT > 0 && c.passCar >= 0) {
         const Car& a = cars[c.passCar];
         float widAvg = (cs.wid + CLS[a.cls].wid) * 0.5f;
-        const float lane = widAvg + 1.5f, edge = hwC + 1.8f;
+        const float lane = widAvg + 1.5f, edge = hwC + PASS_EDGE;
         float want = a.dPath + c.passSide * lane;
         if (fabsf(want) > edge) {                  // they've closed that side
           float other = a.dPath - c.passSide * lane;
           bool alongside = sDelta(c.s, a.s) < (cs.len + CLS[a.cls].len) * 0.5f;
           if (fabsf(other) <= edge && !alongside) { c.passSide = (int8_t)-c.passSide; want = other; }   // switch
-          else if (!alongside) c.passT = 0;        // tuck back in behind
+          else if (!alongside) { c.passT = 0; c.passCd = PASS_RETRY; }   // tuck back in behind
+          else if (sDelta(a.s, c.s) < 0) { c.passT = 0; c.passCd = PASS_RETRY; vT = fmn(vT, fmx(a.v - 3.0f, 10.0f)); }   // squeezed: lift and drop in behind
         }
         dT = clampf(want, -edge, edge);
         // alongside and on the inside of the next corner: the other car gives way
@@ -474,6 +508,25 @@ static void updateCars(float dt, bool racing, bool coolDown) {
       if (c.blockT > 0 && attacker >= 0) { c.blockT -= dt; dT = clampf(cars[attacker].dPath, -hwC, hwC); }
       else if (c.blockT > 0) c.blockT -= dt;
       if (c.blockCd > 0) c.blockCd -= dt;
+      if (c.passCd > 0) c.passCd -= dt;
+
+      // Racing room: with a car alongside, don't take the line through it. If
+      // that leaves no road and we're the one behind, lift and tuck in.
+      if (racing && c.state == CS_RACE) {
+        const float edgeR = hwC + PASS_EDGE;
+        for (int j = 0; j < numCars; ++j) {
+          if (j == i) continue;
+          const Car& o = cars[j];
+          if (o.state != CS_RACE || o.v < 15.0f || c.v < 15.0f) continue;   // a slow scramble: the normal traffic rules handle it
+          float lenAvg = (cs.len + CLS[o.cls].len) * 0.5f, widAvg = (cs.wid + CLS[o.cls].wid) * 0.5f;
+          float g = sDelta(c.s, o.s);
+          if (fabsf(g) > lenAvg * 1.1f || fabsf(o.d - c.d) > widAvg + 4.0f) continue;
+          const float room = widAvg + ((T.cornerAttack || T.blocks) ? RACE_ROOM_TIGHT : RACE_ROOM);
+          if (o.d >= c.d) { dT = fmn(dT, o.d - room); if (dT < -edgeR && g > 0) { if (c.passT > 0) c.passCd = PASS_RETRY; c.passT = 0; vT = fmn(vT, fmx(o.v - 3.0f, 10.0f)); } }
+          else            { dT = fmx(dT, o.d + room); if (dT >  edgeR && g > 0) { if (c.passT > 0) c.passCd = PASS_RETRY; c.passT = 0; vT = fmn(vT, fmx(o.v - 3.0f, 10.0f)); } }
+          dT = clampf(dT, -edgeR, edgeR);
+        }
+      }
 
       if (!racing || raceTime < c.react) { vT = 0; dT = c.d; }
       c.dbgVT = vT; c.dbgAhead = (int8_t)ahead;
@@ -481,7 +534,10 @@ static void updateCars(float dt, bool racing, bool coolDown) {
       // ── Lane: the offset of the line being followed eases toward the target ──
       float laneRate = 0.24f * c.v + (c.v > 4.0f ? 5.0f : 0.0f);
       float oldPath = c.dPath;
-      c.dPath += clampf(dT - c.dPath, -laneRate * dt, laneRate * dt);
+      // ease into the new line: full rate when it's far, slowing as it arrives,
+      // so the car settles onto it instead of overshooting at speed
+      const float laneStep = fmn(laneRate, LANE_EASE * fabsf(dT - c.dPath) + 2.0f) * dt;
+      c.dPath += clampf(dT - c.dPath, -laneStep, laneStep);
       c.dPath = clampf(c.dPath, -hw - 6.0f, hw + 6.0f);
 
       // ── Longitudinal ──
@@ -626,9 +682,20 @@ static void updateCars(float dt, bool racing, bool coolDown) {
         pushEv(EV_CONTACT, ri, fi);
       }
       if (fabsf(dd) < need * 0.45f) { rear.v = fmn(rear.v, front.v * 0.97f); continue; }   // nose to tail
-      float push = (need - fabsf(dd)) * 0.5f * (dd >= 0 ? 1.0f : -1.0f);
-      a.d -= push; b.d += push;
-      placeOnTrack(a); placeOnTrack(b);
+      // Push them apart, but whoever is already at the edge of the road gives
+      // less and the other car takes the rest.
+      const float sgn = dd >= 0 ? 1.0f : -1.0f;      // b is on this side of a
+      float pushA = (need - fabsf(dd)) * 0.5f, pushB = pushA;
+      const float limA = trk.hw + KERB_W * 0.5f - CLS[a.cls].wid * 0.5f, limB = trk.hw + KERB_W * 0.5f - CLS[b.cls].wid * 0.5f;
+      float roomA = limA + sgn * a.d, roomB = limB - sgn * b.d;   // how far each can move outward
+      if (pushB > roomB) { float x = pushB - fmx(roomB, 0.0f); pushB -= x; pushA += x; }
+      if (pushA > roomA) { float x = pushA - fmx(roomA, 0.0f); pushA -= x; pushB += x; }
+      // Nudge sideways only. Re-placing the cars from (s, d) would throw away
+      // their forward motion wherever s barely changes (the inside of a tight
+      // hairpin), pinning a car next to its neighbour for good.
+      TrackFrame fa, fb; trackAt(a.s, fa); trackAt(b.s, fb);
+      a.d -= sgn * pushA; a.x += fa.ty * sgn * pushA; a.y -= fa.tx * sgn * pushA;
+      b.d += sgn * pushB; b.x -= fb.ty * sgn * pushB; b.y += fb.tx * sgn * pushB;
     }
 
   // ── Corners, laps, timing ──
@@ -828,6 +895,18 @@ static void IRAM_ATTR drawCarBody(int i) {
       { int rx, ry; carPt(d, -0.1f, 0, rx, ry); fCircle(rx, ry, (int)fmx(1, d.hwd * 0.35f), litT(0xF4F4F4u)); }
       cQuad(d, 0.6f, 0.98f, 0.85f, 1.0f, c3); cQuad(d, 0.6f, 0.98f, -1.0f, -0.85f, c3);
       cQuad(d, 0.94f, 1.0f, 0.5f, 0.85f, litT(0xF0F0D8u)); cQuad(d, 0.94f, 1.0f, -0.85f, -0.5f, litT(0xF0F0D8u));
+      break;
+    case CC_VAN:   // panel van: short sloping bonnet, long flat roof
+      cQuad(d, -1.0f, 0.62f, -1.0f, 1.0f, c1);
+      cTri(d, 0.62f, -1.0f, 1.0f, -0.82f, 1.0f, 0.82f, c1);
+      cTri(d, 0.62f, -1.0f, 1.0f, 0.82f, 0.62f, 1.0f, c1);
+      cQuad(d, 0.46f, 0.64f, -0.86f, 0.86f, glass);             // windscreen
+      cQuad(d, -0.94f, 0.42f, -0.30f, 0.30f, c2);               // roof stripe
+      cQuad(d, -0.72f, -0.62f, -0.88f, 0.88f, litT(0x2A2E34u)); // roof-rack bars
+      cQuad(d, -0.30f, -0.20f, -0.88f, 0.88f, litT(0x2A2E34u));
+      cQuad(d, -1.0f, -0.96f, -0.03f, 0.03f, dark);             // split rear doors
+      { int rx, ry; carPt(d, 0.12f, 0, rx, ry); fCircle(rx, ry, (int)fmx(1, d.hwd * 0.34f), litT(0xF4F4F4u)); }
+      cQuad(d, 0.94f, 1.0f, 0.55f, 0.86f, litT(0xF0F0D8u)); cQuad(d, 0.94f, 1.0f, -0.86f, -0.55f, litT(0xF0F0D8u));
       break;
     default:   // CC_CLASSIC — cigar-shaped single-seater
       cWheels(d, 0.35f, 0.65f, -0.68f, -0.32f, 0.62f, tyre);

@@ -32,7 +32,7 @@ enum UiId : int8_t {
   UI_P_SLIDER, UI_P_WX_PREV, UI_P_WX_NEXT, UI_P_TIME_PREV, UI_P_TIME_NEXT, UI_P_CARS_MINUS, UI_P_CARS_PLUS,
   UI_P_TRACK_PREV, UI_P_TRACK_NEXT, UI_P_LAPS_PREV, UI_P_LAPS_NEXT, UI_P_SER_PREV, UI_P_SER_NEXT,
   UI_P_CAM_PREV, UI_P_CAM_NEXT, UI_P_SPEC_PREV, UI_P_SPEC_NEXT,
-  UI_P_NEXT_RACE, UI_P_CLOSE, UI_COUNT
+  UI_P_NEXT_RACE, UI_P_CLOSE, UI_P_DRIVERS, UI_COUNT
 };
 
 #define NUM_TOP_BTN 5
@@ -52,6 +52,26 @@ static const Rect P_ARROW_L(int row) { return { CTRL_X, (int16_t)(ROW_Y(row) - 2
 static const Rect P_ARROW_R(int row) { return { CTRL_R, (int16_t)(ROW_Y(row) - 2), 44, 34 }; }
 static const Rect P_NEXT_RACE = { PANEL_X + 24, PANEL_Y + PANEL_H - 52, 170, 40 };
 static const Rect P_CLOSE     = { PANEL_X + PANEL_W - 132, PANEL_Y + PANEL_H - 52, 108, 40 };
+static const Rect P_DRIVERS   = { PANEL_X + 24 + 170 + 14, PANEL_Y + PANEL_H - 52, 118, 40 };
+
+// Rows top to bottom: which control pair each row is (prev/next ids are adjacent).
+static const int8_t ROW_ID[PANEL_ROWS + 1] = { UI_NONE, UI_P_WX_PREV, UI_P_TIME_PREV, UI_P_CARS_MINUS, UI_P_TRACK_PREV,
+                                               UI_P_SER_PREV, UI_P_LAPS_PREV, UI_P_CAM_PREV, UI_P_SPEC_PREV };
+
+// ─── Drivers page and its name keyboard ──────────────────────────────────────
+// panelPage 0 = settings, 1 = drivers, 2 = editing a driver's name.
+static int  panelPage = 0;
+static int  editSlot = 0;
+static char editBuf[4] = "";
+enum : int { UI_D_TOGGLE = 100, UI_D_COPY, UI_D_BACK, UI_D_NAME0 = 110, UI_D_TRAIT0 = 140,
+             UI_K_KEY0 = 200, UI_K_DEL = 250, UI_K_CANCEL, UI_K_OK };
+static const char KEYS[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+#define NUM_KEYS 36
+static const Rect D_TOGGLE = { PANEL_X + PANEL_W - 190, PANEL_Y + 10, 166, 34 };
+static Rect dSlotName(int k)  { int col = k / 10, row = k % 10; return { (int16_t)(PANEL_X + 16 + col * 240 + 26), (int16_t)(PANEL_Y + 78 + row * 31), 62, 27 }; }
+static Rect dSlotTrait(int k) { int col = k / 10, row = k % 10; return { (int16_t)(PANEL_X + 16 + col * 240 + 94), (int16_t)(PANEL_Y + 78 + row * 31), 132, 27 }; }
+static Rect kKey(int i)       { int col = i % 9, row = i / 9; return { (int16_t)(PANEL_X + 27 + col * 50), (int16_t)(PANEL_Y + 112 + row * 48), 46, 42 }; }
+static const Rect K_DEL = { PANEL_X + 24, PANEL_Y + 320, 130, 40 };
 static const Rect PANEL       = { PANEL_X, PANEL_Y, PANEL_W, PANEL_H };
 
 static uint32_t nextRaceArmUntil = 0;
@@ -65,12 +85,30 @@ static int hitTopButton(int x, int y) {
 }
 
 static int hitPanel(int x, int y) {
+  if (panelPage == 1) {
+    if (D_TOGGLE.hit(x, y)) return UI_D_TOGGLE;
+    for (int k = 0; k < MAX_CARS; ++k) {
+      if (dSlotName(k).hit(x, y)) return UI_D_NAME0 + k;
+      if (dSlotTrait(k).hit(x, y)) return UI_D_TRAIT0 + k;
+    }
+    if (P_NEXT_RACE.hit(x, y)) return UI_D_COPY;
+    if (P_CLOSE.hit(x, y)) return UI_D_BACK;
+    return UI_NONE;
+  }
+  if (panelPage == 2) {
+    for (int i = 0; i < NUM_KEYS; ++i) if (kKey(i).hit(x, y)) return UI_K_KEY0 + i;
+    if (K_DEL.hit(x, y)) return UI_K_DEL;
+    if (P_NEXT_RACE.hit(x, y)) return UI_K_CANCEL;
+    if (P_CLOSE.hit(x, y)) return UI_K_OK;
+    return UI_NONE;
+  }
   if (P_SLIDER.hit(x, y)) return UI_P_SLIDER;
   for (int row = 1; row <= PANEL_ROWS; ++row) {
-    if (P_ARROW_L(row).hit(x, y)) return UI_P_WX_PREV + (row - 1) * 2;
-    if (P_ARROW_R(row).hit(x, y)) return UI_P_WX_NEXT + (row - 1) * 2;
+    if (P_ARROW_L(row).hit(x, y)) return ROW_ID[row];
+    if (P_ARROW_R(row).hit(x, y)) return ROW_ID[row] + 1;
   }
   if (P_NEXT_RACE.hit(x, y)) return UI_P_NEXT_RACE;
+  if (P_DRIVERS.hit(x, y)) return UI_P_DRIVERS;
   if (P_CLOSE.hit(x, y)) return UI_P_CLOSE;
   return UI_NONE;
 }
@@ -142,8 +180,42 @@ static void setSpectator(bool on) {
   toast(b, 2200);
 }
 
+static void closePanel() { panelOpen = false; panelPage = 0; saveSettings(); }
+
+static void driversAction(int id) {
+  if (id == UI_D_TOGGLE) {
+    customDrivers = !customDrivers;
+    toast(customDrivers ? "Custom drivers: from the next race" : "Random drivers: from the next race", 2200);
+  } else if (id == UI_D_COPY) {                       // start from the field that's racing now
+    for (int i = 0; i < numCars && i < MAX_CARS; ++i) { memcpy(customCode[i], cars[i].code, 4); customCode[i][3] = 0; customTrait[i] = cars[i].trait; }
+    toast("Copied this race's drivers", 1800);
+  } else if (id == UI_D_BACK) {
+    panelPage = 0; saveSettings();
+  } else if (id >= UI_D_TRAIT0 && id < UI_D_TRAIT0 + MAX_CARS) {
+    uint8_t& t = customTrait[id - UI_D_TRAIT0];
+    t = (uint8_t)((t + 1) % TR_COUNT);
+  } else if (id >= UI_D_NAME0 && id < UI_D_NAME0 + MAX_CARS) {
+    editSlot = id - UI_D_NAME0;
+    memcpy(editBuf, customCode[editSlot], 4); editBuf[3] = 0;
+    panelPage = 2;
+  } else if (id >= UI_K_KEY0 && id < UI_K_KEY0 + NUM_KEYS) {
+    size_t n = strlen(editBuf);
+    if (n < 3) { editBuf[n] = KEYS[id - UI_K_KEY0]; editBuf[n + 1] = 0; }
+  } else if (id == UI_K_DEL) {
+    size_t n = strlen(editBuf);
+    if (n > 0) editBuf[n - 1] = 0;
+  } else if (id == UI_K_CANCEL) {
+    panelPage = 1;
+  } else if (id == UI_K_OK) {
+    if (editBuf[0]) { memcpy(customCode[editSlot], editBuf, 4); customCode[editSlot][3] = 0; }
+    panelPage = 1;
+  }
+}
+
 static void panelAction(int id) {
+  if (id >= 100) { driversAction(id); return; }
   switch (id) {
+    case UI_P_DRIVERS: panelPage = 1; break;
     case UI_P_WX_PREV: case UI_P_WX_NEXT: {
       int v = weatherOverride + (id == UI_P_WX_NEXT ? 1 : -1);
       if (v < -1) v = WEATHER_COUNT - 1;
@@ -186,7 +258,7 @@ static void panelAction(int id) {
         nextRaceArmUntil = millis() + 3000;
       }
       break;
-    case UI_P_CLOSE: panelOpen = false; saveSettings(); break;
+    case UI_P_CLOSE: closePanel(); break;
     default: break;
   }
 }
@@ -196,7 +268,7 @@ static void topButtonAction(int id) {
     case UI_ZOOM_OUT: if (!spectator) { autoCam = false; startZoomStep(-1); } break;
     case UI_ZOOM_IN:  if (!spectator) { autoCam = false; startZoomStep(+1); } break;
     case UI_HUD:      hudOn = !hudOn; saveSettings(); break;
-    case UI_SETTINGS: panelOpen = !panelOpen; if (!panelOpen) saveSettings(); break;
+    case UI_SETTINGS: if (panelOpen) closePanel(); else { panelOpen = true; panelPage = 0; } break;
     case UI_SPECTATE: setSpectator(!spectator); saveSettings(); break;
   }
 }
@@ -236,7 +308,7 @@ static void onDown(int x, int y) {
   if (panelOpen) {
     int id = hitTopButton(x, y);
     if (id == UI_SETTINGS) { ts.mode = TM_UI; ts.uiId = id; return; }
-    if (!PANEL.hit(x, y)) { panelOpen = false; saveSettings(); ts.mode = TM_UI; ts.uiId = UI_NONE; return; }
+    if (!PANEL.hit(x, y)) { closePanel(); ts.mode = TM_UI; ts.uiId = UI_NONE; return; }
     id = hitPanel(x, y);
     if (id == UI_P_SLIDER) { ts.mode = TM_SLIDER; applyBrightnessFromX(x); return; }
     ts.mode = TM_PANEL; ts.uiId = id;
@@ -902,12 +974,68 @@ static void drawPanelRow(int row, const char* label, const char* value, bool plu
   drawText(value, (l.x + r.x + r.w) / 2, ROW_Y(row) + 15, 0xFFFFFFu, f, textdatum_t::middle_center);
 }
 
+static void drawPanelButton(const Rect& r, const char* label, uint32_t bg, uint32_t a = 26) {
+  blendRoundRect(r.x, r.y, r.w, r.h, 10, bg, a);
+  drawText(label, r.x + r.w / 2, r.y + r.h / 2, 0xFFFFFFu, &fonts::DejaVu12, textdatum_t::middle_center);
+}
+
+static void drawDriversPage() {
+  drawText("Drivers", PANEL_X + 24, PANEL_Y + 26, 0xF4F8F8u, &fonts::DejaVu18, textdatum_t::middle_left);
+  drawPanelButton(D_TOGGLE, customDrivers ? "Custom: On" : "Custom: Off", customDrivers ? 0xB0302Au : 0x3A4450u, 28);
+  drawText(customDrivers ? "On: these drivers race (from the next race). Tap to edit."
+                         : "Off: random names and traits each race.",
+           PANEL_X + 24, PANEL_Y + 60, 0x9AA6B0u, &fonts::DejaVu9, textdatum_t::middle_left);
+  char b[8];
+  for (int k = 0; k < MAX_CARS; ++k) {
+    Rect n = dSlotName(k), t = dSlotTrait(k);
+    if (!stripHit(n.y, n.y + n.h)) continue;
+    const bool inRace = k < carSetting;                 // slots past the car count sit out
+    const uint32_t txt = (customDrivers && inRace) ? 0xFFFFFFu : 0x7A8690u;
+    snprintf(b, sizeof(b), "%d", k + 1);
+    drawText(b, n.x - 6, n.y + n.h / 2, 0x8A98A0u, &fonts::DejaVu9, textdatum_t::middle_right);
+    blendRoundRect(n.x, n.y, n.w, n.h, 7, 0x3A4450u, 24);
+    drawText(customCode[k], n.x + n.w / 2, n.y + n.h / 2, txt, &fonts::DejaVu12, textdatum_t::middle_center);
+    blendRoundRect(t.x, t.y, t.w, t.h, 7, 0x3A4450u, 24);
+    const TraitSpec& T = TRAITS[customTrait[k] < TR_COUNT ? customTrait[k] : TR_BALANCED];
+    fCircle(t.x + 12, t.y + t.h / 2, 4, inRace ? T.col : 0x5A646Cu);
+    drawText(T.name, t.x + 24, t.y + t.h / 2, txt, &fonts::DejaVu12, textdatum_t::middle_left);
+  }
+  drawPanelButton(P_NEXT_RACE, "Copy this race", 0x3A4450u);
+  drawPanelButton(P_CLOSE, "Back", 0xB0302Au, 28);
+}
+
+static void drawKeyboardPage() {
+  char b[32];
+  snprintf(b, sizeof(b), "Driver %d name", editSlot + 1);
+  drawText(b, PANEL_X + 24, PANEL_Y + 26, 0xF4F8F8u, &fonts::DejaVu18, textdatum_t::middle_left);
+  // the name being typed, with a cursor while there's room
+  const int bx = PANEL_X + PANEL_W / 2 - 60, by = PANEL_Y + 52;
+  blendRoundRect(bx, by, 120, 46, 10, 0x000000u, 26);
+  snprintf(b, sizeof(b), "%s%s", editBuf, strlen(editBuf) < 3 ? "_" : "");
+  drawText(b, bx + 60, by + 23, 0xFFFFFFu, &fonts::DejaVu24, textdatum_t::middle_center);
+  drawText("Up to 3 letters", bx + 132, by + 23, 0x8A98A0u, &fonts::DejaVu9, textdatum_t::middle_left);
+  for (int i = 0; i < NUM_KEYS; ++i) {
+    Rect r = kKey(i);
+    if (!stripHit(r.y, r.y + r.h)) continue;
+    blendRoundRect(r.x, r.y, r.w, r.h, 8, 0x3A4450u, 26);
+    char k[2] = { KEYS[i], 0 };
+    drawText(k, r.x + r.w / 2, r.y + r.h / 2, 0xFFFFFFu, &fonts::DejaVu18, textdatum_t::middle_center);
+  }
+  drawPanelButton(K_DEL, "Delete", 0x3A4450u);
+  drawPanelButton(P_NEXT_RACE, "Cancel", 0x3A4450u);
+  drawPanelButton(P_CLOSE, "OK", 0xB0302Au, 28);
+}
+
 static void drawPanel() {
   if (!panelOpen || !stripHit(PANEL_Y, PANEL_Y + PANEL_H)) return;
   blendRoundRect(PANEL_X, PANEL_Y, PANEL_W, PANEL_H, 14, 0x0A0E12u, 28);
   canvas.drawRoundRect(PANEL_X, PANEL_Y, PANEL_W, PANEL_H, 14, 0x7A8088u);
+  if (panelPage == 1) { drawDriversPage(); return; }
+  if (panelPage == 2) { drawKeyboardPage(); return; }
   drawText("Race settings", PANEL_X + 24, PANEL_Y + 26, 0xF4F8F8u, &fonts::DejaVu18, textdatum_t::middle_left);
   char buf[48];
+  snprintf(buf, sizeof(buf), "v%s  WiFi %s", FIRMWARE_VERSION, WiFi.status() == WL_CONNECTED ? "on" : "off");
+  drawText(buf, PANEL_X + PANEL_W - 24, PANEL_Y + 26, 0x8A98A0u, &fonts::DejaVu9, textdatum_t::middle_right);
 
   drawText("Brightness", PANEL_X + 24, ROW_Y(0) + 15, 0xC8D0D8u, &fonts::DejaVu12, textdatum_t::middle_left);
   int sx0 = P_SLIDER.x + 10, sw = P_SLIDER.w - 20, sy = P_SLIDER.y + P_SLIDER.h / 2;
@@ -923,19 +1051,18 @@ static void drawPanel() {
   else snprintf(buf, sizeof(buf), "%s", TIME_MODE_NAMES[currentTimeMode]);
   drawPanelRow(2, "Time of day", buf);
   snprintf(buf, sizeof(buf), "%d", carSetting);
-  drawPanelRow(3, "Cars", buf, true);
+  drawPanelRow(3, "Number of cars", buf, true);
   drawPanelRow(4, "Track", trackModeName(trackMode));
+  drawPanelRow(5, "Car type", seriesSelName(seriesSel));
   if (LAPS_OPTS[lapsIdx] == 0) snprintf(buf, sizeof(buf), "Endless"); else snprintf(buf, sizeof(buf), "%d laps", LAPS_OPTS[lapsIdx]);
-  drawPanelRow(5, "Race length", buf);
-  drawPanelRow(6, "Series", seriesSelName(seriesSel));
+  drawPanelRow(6, "Race length", buf);
   drawPanelRow(7, "Camera", CAM_MODE_NAMES[camMode]);
   drawPanelRow(8, "Spectator", spectator ? "On - camera locked" : "Off - auto after 30 s");
 
   bool armed = millis() < nextRaceArmUntil;
   blendRoundRect(P_NEXT_RACE.x, P_NEXT_RACE.y, P_NEXT_RACE.w, P_NEXT_RACE.h, 10, armed ? 0xB02A20u : 0x3A4450u, 26);
   drawText(armed ? "Tap again" : "Next race now", P_NEXT_RACE.x + P_NEXT_RACE.w / 2, P_NEXT_RACE.y + P_NEXT_RACE.h / 2, 0xFFFFFFu, &fonts::DejaVu12, textdatum_t::middle_center);
-  snprintf(buf, sizeof(buf), "v%s  WiFi %s", FIRMWARE_VERSION, WiFi.status() == WL_CONNECTED ? "on" : "off");
-  drawText(buf, P_NEXT_RACE.x + P_NEXT_RACE.w + 16, P_CLOSE.y + P_CLOSE.h / 2, 0x8A98A0u, &fonts::DejaVu9, textdatum_t::middle_left);
+  drawPanelButton(P_DRIVERS, customDrivers ? "Drivers: On" : "Drivers", customDrivers ? 0x7A2A26u : 0x3A4450u);
   blendRoundRect(P_CLOSE.x, P_CLOSE.y, P_CLOSE.w, P_CLOSE.h, 10, 0xB0302Au, 28);
   drawText("Done", P_CLOSE.x + P_CLOSE.w / 2, P_CLOSE.y + P_CLOSE.h / 2, 0xFFFFFFu, &fonts::DejaVu12, textdatum_t::middle_center);
 }

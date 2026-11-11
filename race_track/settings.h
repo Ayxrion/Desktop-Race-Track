@@ -32,7 +32,17 @@ static const char* trackModeName(int m) {
   if (m == 1) return "Random";
   return PRESETS[clampi(m - 2, 0, NUM_PRESETS - 1)].name;
 }
-static const char* seriesSelName(int s) { return s == 0 ? "Auto" : SERIES_NAMES[clampi(s - 1, 0, SER_COUNT - 1)]; }
+static const char* seriesSelName(int s) { return s == 0 ? "Random" : SERIES_NAMES[clampi(s - 1, 0, SER_COUNT - 1)]; }
+
+// Default driver slots (before the user edits any): a spread of names and traits.
+static void defaultCustomDrivers() {
+  static const uint8_t MIX[5] = { TR_BALANCED, TR_AGGRESSIVE, TR_CAUTIOUS, TR_DEFENSIVE, TR_PATIENT };
+  for (int i = 0; i < MAX_CARS; ++i) {
+    memcpy(customCode[i], DRIVER_CODES[i % NUM_CODES], 3); customCode[i][3] = 0;
+    customTrait[i] = MIX[(i * 3) % 5];
+  }
+}
+struct DriverBlob { char code[MAX_CARS][4]; uint8_t trait[MAX_CARS]; };
 
 static void loadSettings() {
   prefs.begin(SETTINGS_NS, true);
@@ -47,6 +57,16 @@ static void loadSettings() {
   rotIdx          = prefs.getULong("rot", 0);
   camMode         = prefs.getUChar("cam", 0);
   spectator       = prefs.getBool("spect", false);
+  customDrivers   = prefs.getBool("cdrv", false);
+  {
+    DriverBlob b;
+    if (prefs.getBytesLength("drv") == sizeof(b) && prefs.getBytes("drv", &b, sizeof(b)) == sizeof(b)) {
+      for (int i = 0; i < MAX_CARS; ++i) {
+        memcpy(customCode[i], b.code[i], 4); customCode[i][3] = 0;
+        customTrait[i] = b.trait[i] < TR_COUNT ? b.trait[i] : (uint8_t)TR_BALANCED;
+      }
+    } else defaultCustomDrivers();
+  }
   prefs.end();
   if (camMode >= CAM_MODE_COUNT) camMode = 0;
   if (weatherOverride >= WEATHER_COUNT) weatherOverride = -1;
@@ -67,6 +87,12 @@ static void saveSettings() {
   prefs.putBool("hud", hudOn);
   prefs.putUChar("cam", camMode);
   prefs.putBool("spect", spectator);
+  prefs.putBool("cdrv", customDrivers);
+  {
+    DriverBlob b;
+    memcpy(b.code, customCode, sizeof(b.code)); memcpy(b.trait, customTrait, sizeof(b.trait));
+    prefs.putBytes("drv", &b, sizeof(b));
+  }
   prefs.end();
 }
 
@@ -82,7 +108,7 @@ static void pickNextRace(int& sel, uint32_t& seed, uint8_t& series) {
   else                     sel = trackMode - 2;
   if (seriesSel == 0) {
     // Formula a little more often than the others
-    static const uint8_t AUTO_SERIES[] = { SER_FORMULA, SER_GT, SER_ENDURANCE, SER_FORMULA, SER_TOURING, SER_CLASSIC, SER_GT, SER_FORMULA };
+    static const uint8_t AUTO_SERIES[] = { SER_FORMULA, SER_GT, SER_ENDURANCE, SER_FORMULA, SER_TOURING, SER_CLASSIC, SER_GT, SER_FORMULA, SER_VANS };
     series = AUTO_SERIES[hash32(rotIdx * 31 + 7) % sizeof(AUTO_SERIES)];
   } else {
     series = seriesSel - 1;
