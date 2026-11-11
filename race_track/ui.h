@@ -28,26 +28,30 @@ static void toast(const char* m, uint32_t ms = 1800) {
 struct Rect { int16_t x, y, w, h; bool hit(int px, int py) const { return px >= x && px < x + w && py >= y && py < y + h; } };
 
 enum UiId : int8_t {
-  UI_NONE = -1, UI_ZOOM_OUT = 0, UI_ZOOM_IN, UI_HUD, UI_SETTINGS,
+  UI_NONE = -1, UI_ZOOM_OUT = 0, UI_ZOOM_IN, UI_HUD, UI_SETTINGS, UI_SPECTATE,
   UI_P_SLIDER, UI_P_WX_PREV, UI_P_WX_NEXT, UI_P_TIME_PREV, UI_P_TIME_NEXT, UI_P_CARS_MINUS, UI_P_CARS_PLUS,
   UI_P_TRACK_PREV, UI_P_TRACK_NEXT, UI_P_LAPS_PREV, UI_P_LAPS_NEXT, UI_P_SER_PREV, UI_P_SER_NEXT,
+  UI_P_CAM_PREV, UI_P_CAM_NEXT, UI_P_SPEC_PREV, UI_P_SPEC_NEXT,
   UI_P_NEXT_RACE, UI_P_CLOSE, UI_COUNT
 };
 
-static const Rect BTN[4] = { { 572, 8, 50, 46 }, { 630, 8, 50, 46 }, { 688, 8, 50, 46 }, { 746, 8, 46, 46 } };
+#define NUM_TOP_BTN 5
+// zoom out, zoom in, leaderboard, settings, spectator (TV) — the TV button sits leftmost
+static const Rect BTN[NUM_TOP_BTN] = { { 572, 8, 50, 46 }, { 630, 8, 50, 46 }, { 688, 8, 50, 46 }, { 746, 8, 46, 46 }, { 514, 8, 50, 46 } };
 
 #define PANEL_X 150
-#define PANEL_Y 14
+#define PANEL_Y 7
 #define PANEL_W 500
-#define PANEL_H 452
-#define ROW_Y(i) (PANEL_Y + 52 + (i) * 44)
+#define PANEL_H 466
+#define PANEL_ROWS 8                         // arrow rows (row 0 is the brightness slider)
+#define ROW_Y(i) (PANEL_Y + 50 + (i) * 39)
 #define CTRL_X   (PANEL_X + 190)
 #define CTRL_R   (PANEL_X + PANEL_W - 64)
 static const Rect P_SLIDER  = { CTRL_X, ROW_Y(0) - 4, 270, 38 };
 static const Rect P_ARROW_L(int row) { return { CTRL_X, (int16_t)(ROW_Y(row) - 2), 44, 34 }; }
 static const Rect P_ARROW_R(int row) { return { CTRL_R, (int16_t)(ROW_Y(row) - 2), 44, 34 }; }
-static const Rect P_NEXT_RACE = { PANEL_X + 24, PANEL_Y + PANEL_H - 56, 170, 42 };
-static const Rect P_CLOSE     = { PANEL_X + PANEL_W - 132, PANEL_Y + PANEL_H - 56, 108, 42 };
+static const Rect P_NEXT_RACE = { PANEL_X + 24, PANEL_Y + PANEL_H - 52, 170, 40 };
+static const Rect P_CLOSE     = { PANEL_X + PANEL_W - 132, PANEL_Y + PANEL_H - 52, 108, 40 };
 static const Rect PANEL       = { PANEL_X, PANEL_Y, PANEL_W, PANEL_H };
 
 static uint32_t nextRaceArmUntil = 0;
@@ -56,13 +60,13 @@ static bool uiVisible() { return panelOpen || (millis() - lastTouchMs < UI_HIDE_
 
 static int hitTopButton(int x, int y) {
   if (!uiVisible()) return UI_NONE;
-  for (int i = 0; i < 4; ++i) if (BTN[i].hit(x, y)) return i;
+  for (int i = 0; i < NUM_TOP_BTN; ++i) if (BTN[i].hit(x, y)) return i;
   return UI_NONE;
 }
 
 static int hitPanel(int x, int y) {
   if (P_SLIDER.hit(x, y)) return UI_P_SLIDER;
-  for (int row = 1; row <= 6; ++row) {
+  for (int row = 1; row <= PANEL_ROWS; ++row) {
     if (P_ARROW_L(row).hit(x, y)) return UI_P_WX_PREV + (row - 1) * 2;
     if (P_ARROW_R(row).hit(x, y)) return UI_P_WX_NEXT + (row - 1) * 2;
   }
@@ -103,6 +107,12 @@ static void iconPlus(int cx, int cy, uint32_t c)  { iconMinus(cx, cy, c); canvas
 static void iconList(int cx, int cy, uint32_t c) {
   for (int k = -1; k <= 1; ++k) { canvas.fillRect(cx - 12, cy + k * 7 - 2, 4, 4, c); canvas.fillRoundRect(cx - 5, cy + k * 7 - 2, 17, 4, 1, c); }
 }
+static void iconTv(int cx, int cy, uint32_t c, uint32_t hole) {
+  wideLine(cx - 7, cy - 14, cx - 1, cy - 7, 2.0f, c);
+  wideLine(cx + 7, cy - 14, cx + 1, cy - 7, 2.0f, c);
+  canvas.fillRoundRect(cx - 14, cy - 7, 28, 19, 4, c);
+  canvas.fillRoundRect(cx - 11, cy - 4, 22, 13, 2, hole);
+}
 static void iconGear(int cx, int cy, uint32_t c, uint32_t hole) {
   for (int k = 0; k < 8; ++k) {
     float a = k * PI / 4;
@@ -120,6 +130,17 @@ static void applyBrightnessFromX(int x) {
 }
 
 static inline int cyc(int v, int n) { return ((v % n) + n) % n; }
+
+static void cutToAutoCam();                    // defined with the TV camera
+
+static void setSpectator(bool on) {
+  spectator = on;
+  if (on) cutToAutoCam();
+  char b[48];
+  if (on) snprintf(b, sizeof(b), "Spectator: %s", CAM_MODE_NAMES[camMode]);
+  else    snprintf(b, sizeof(b), "Spectator off - touch to take over");
+  toast(b, 2200);
+}
 
 static void panelAction(int id) {
   switch (id) {
@@ -148,6 +169,13 @@ static void panelAction(int id) {
     case UI_P_SER_PREV: case UI_P_SER_NEXT:
       seriesSel = (uint8_t)cyc(seriesSel + (id == UI_P_SER_NEXT ? 1 : -1), SERIES_SEL_COUNT);
       break;
+    case UI_P_CAM_PREV: case UI_P_CAM_NEXT:
+      camMode = (uint8_t)cyc(camMode + (id == UI_P_CAM_NEXT ? 1 : -1), CAM_MODE_COUNT);
+      cutToAutoCam();                         // show the new camera straight away
+      break;
+    case UI_P_SPEC_PREV: case UI_P_SPEC_NEXT:
+      setSpectator(!spectator);
+      break;
     case UI_P_NEXT_RACE:
       if (millis() < nextRaceArmUntil) {
         saveSettings();
@@ -165,10 +193,11 @@ static void panelAction(int id) {
 
 static void topButtonAction(int id) {
   switch (id) {
-    case UI_ZOOM_OUT: startZoomStep(-1); break;
-    case UI_ZOOM_IN:  startZoomStep(+1); break;
+    case UI_ZOOM_OUT: if (!spectator) { autoCam = false; startZoomStep(-1); } break;
+    case UI_ZOOM_IN:  if (!spectator) { autoCam = false; startZoomStep(+1); } break;
     case UI_HUD:      hudOn = !hudOn; saveSettings(); break;
     case UI_SETTINGS: panelOpen = !panelOpen; if (!panelOpen) saveSettings(); break;
+    case UI_SPECTATE: setSpectator(!spectator); saveSettings(); break;
   }
 }
 
@@ -215,6 +244,11 @@ static void onDown(int x, int y) {
   }
   int id = hitTopButton(x, y);
   if (id != UI_NONE) { ts.mode = TM_UI; ts.uiId = id; return; }
+  if (spectator) {                              // camera is locked to the TV feed
+    ts.mode = TM_UI; ts.uiId = UI_NONE;
+    if (millis() > toastUntil) toast("Spectator mode - tap the TV button to take over", 2200);
+    return;
+  }
   ts.mode = TM_PENDING;
 }
 
@@ -296,7 +330,10 @@ static void pollTouch() {
   if (raw >= effN) { effN = raw; lowCount = 0; }
   else if (++lowCount >= 2) { effN = raw; lowCount = 0; }
   if (effN > 2) effN = 2;
-  if (effN > 0) { lastTouchMs = millis(); autoCam = false; }
+  if (effN > 0) {
+    lastTouchMs = millis();
+    if (!spectator && (ts.mode == TM_PENDING || ts.mode == TM_PAN || ts.mode == TM_PINCH)) autoCam = false;
+  }
 
   if (prevN == 0 && effN >= 1) {
     onDown(tpx[0], tpy[0]);
@@ -315,8 +352,25 @@ static void pollTouch() {
 }
 
 // ─── TV camera ────────────────────────────────────────────────────────────────
-enum TvMode : uint8_t { TV_OVERVIEW, TV_BATTLE, TV_LEADER, TV_CORNER, TV_EVENT, TV_GRID };
-static struct { TvMode mode; int car; int car2; uint32_t until; float tx, ty, tz; } tv = { TV_OVERVIEW, 0, -1, 0, WORLD_W / 2, WORLD_H / 2, ZOOM_MIN };
+// camMode picks which shots it takes: the director mixes them all (and cuts to
+// spins), the others stick to one kind of shot.
+enum TvMode : uint8_t { TV_OVERVIEW, TV_BATTLE, TV_LEADER, TV_CORNER, TV_EVENT, TV_GRID, TV_FOLLOW };
+static struct { TvMode mode; int car; int car2; uint32_t until, since; float tx, ty, tz; int stand; } tv = { TV_OVERVIEW, 0, -1, 0, 0, WORLD_W / 2, WORLD_H / 2, ZOOM_MIN, -1 };
+
+static void cutToAutoCam() {
+  autoCam = true; followCar = -1; tv.until = 0;
+  cam.animZoom = false; cam.vx = cam.vy = 0;
+}
+
+// A random car that's still racing, preferably not the one we're on.
+static int pickRandomDriver(int avoid) {
+  int pick = -1, seen = 0;
+  for (int i = 0; i < numCars; ++i) {
+    if (i == avoid || cars[i].finished || cars[i].state != CS_RACE) continue;
+    if (irandr(0, ++seen) == 0) pick = i;      // reservoir sample
+  }
+  return pick >= 0 ? pick : (avoid >= 0 && avoid < numCars ? avoid : order[0]);
+}
 
 // The closest fight on track: returns the chasing car, sets `front`.
 static int findBattle(int& front) {
@@ -344,26 +398,47 @@ static void camChase(const Car& c, float tz, const Car* other = nullptr) {
 
 static void pickTvShot(uint32_t now) {
   TvMode prev = tv.mode;
-  if (phase == RP_RESULTS || phase == RP_FINISH) {
-    tv.mode = (prev == TV_OVERVIEW || phase == RP_FINISH) ? TV_LEADER : TV_OVERVIEW;
-  } else if (prev == TV_GRID) {
-    tv.mode = TV_LEADER;
-  } else {
-    float r = frand();
-    tv.mode = r < 0.28f ? TV_OVERVIEW : (r < 0.62f ? TV_BATTLE : (r < 0.78f ? TV_LEADER : TV_CORNER));
-    if (tv.mode == prev && prev == TV_OVERVIEW) tv.mode = TV_BATTLE;
-    if (tv.mode == TV_CORNER && trk.nStands == 0) tv.mode = TV_BATTLE;
+  int prevCar = tv.car;
+  switch (camMode) {
+    case CAM_LEADER: tv.mode = TV_LEADER; break;
+    case CAM_BATTLE: tv.mode = TV_BATTLE; break;
+    case CAM_DRIVER: tv.mode = TV_FOLLOW; break;
+    case CAM_STANDS: tv.mode = trk.nStands > 0 ? TV_CORNER : TV_OVERVIEW; break;
+    case CAM_TRACK:  tv.mode = TV_OVERVIEW; break;
+    default:
+      if (phase == RP_RESULTS || phase == RP_FINISH) {
+        tv.mode = (prev == TV_OVERVIEW || phase == RP_FINISH) ? TV_LEADER : TV_OVERVIEW;
+      } else if (prev == TV_GRID) {
+        tv.mode = TV_LEADER;
+      } else {
+        float r = frand();
+        tv.mode = r < 0.26f ? TV_OVERVIEW : (r < 0.56f ? TV_BATTLE : (r < 0.70f ? TV_LEADER : (r < 0.82f ? TV_FOLLOW : TV_CORNER)));
+        if (tv.mode == prev && prev == TV_OVERVIEW) tv.mode = TV_BATTLE;
+        if (tv.mode == TV_CORNER && trk.nStands == 0) tv.mode = TV_BATTLE;
+      }
+      break;
   }
+  tv.since = now;
   switch (tv.mode) {
     case TV_OVERVIEW: tv.tz = ZOOM_MIN; tv.tx = WORLD_W / 2; tv.ty = WORLD_H / 2; tv.until = now + irandr(18000, 30000); break;
     case TV_BATTLE:
       tv.car = findBattle(tv.car2);
-      if (tv.car < 0) { tv.mode = TV_LEADER; tv.car = order[0]; tv.car2 = -1; }
       tv.tz = frandr(1.6f, 2.2f); tv.until = now + irandr(14000, 24000);
+      if (tv.car < 0) {                        // nobody close: show the leader meanwhile
+        tv.mode = TV_LEADER; tv.car = order[0]; tv.car2 = -1;
+        if (camMode == CAM_BATTLE) tv.until = now + 6000;   // and look again soon
+      }
       break;
     case TV_LEADER: tv.car = order[0]; tv.car2 = -1; tv.tz = frandr(1.4f, 1.9f); tv.until = now + irandr(10000, 18000); break;
+    case TV_FOLLOW:
+      tv.car = pickRandomDriver(prev == TV_FOLLOW ? prevCar : -1); tv.car2 = -1;
+      tv.tz = frandr(1.5f, 2.1f); tv.until = now + irandr(22000, 38000);
+      break;
     case TV_CORNER: {
-      const Stand& st = trk.stands[irandr(0, trk.nStands)];
+      int k = irandr(0, trk.nStands);
+      if (trk.nStands > 1 && k == tv.stand) k = (k + 1) % trk.nStands;
+      tv.stand = k;
+      const Stand& st = trk.stands[k];
       trackPoint(st.sc, (st.side ? 1.0f : -1.0f) * (st.d0 * 0.5f), tv.tx, tv.ty);
       tv.tz = frandr(1.3f, 1.7f); tv.until = now + irandr(12000, 18000);
       break;
@@ -379,11 +454,16 @@ static void updateTvCam() {
     if (!panelOpen && ts.mode == TM_NONE && now - lastTouchMs > AUTOCAM_IDLE_MS) { autoCam = true; tv.until = 0; followCar = -1; }
     else return;
   }
-  if (phase == RP_GRID && tv.mode != TV_GRID) { tv.mode = TV_GRID; tv.until = now + 120000; tv.tz = 1.7f; }
-  if (spinCamCar >= 0) {
-    if (tv.mode != TV_EVENT && tv.mode != TV_GRID) { tv.mode = TV_EVENT; tv.car = spinCamCar; tv.car2 = -1; tv.tz = 2.0f; tv.until = now + 9000; }
+  bool gridShot = camMode != CAM_STANDS && camMode != CAM_TRACK;
+  if (phase == RP_GRID && gridShot && tv.mode != TV_GRID) { tv.mode = TV_GRID; tv.since = now; tv.until = now + 120000; tv.tz = 1.7f; }
+  if (spinCamCar >= 0) {                        // replays of spins / contact: director only
+    if (camMode == CAM_DIRECTOR && tv.mode != TV_EVENT && tv.mode != TV_GRID) { tv.mode = TV_EVENT; tv.car = spinCamCar; tv.car2 = -1; tv.tz = 2.0f; tv.since = now; tv.until = now + 9000; }
     spinCamCar = -1;
   }
+  if (tv.mode == TV_LEADER) tv.car = order[0];  // stay on whoever leads now
+  if (camMode == CAM_BATTLE && tv.mode == TV_BATTLE && now - tv.since > 5000 &&
+      (tv.car2 < 0 || fabsf(cars[tv.car2].dist - cars[tv.car].dist) > 80)) tv.until = 0;   // fight's over: find another
+  if (tv.mode == TV_FOLLOW && tv.car >= 0 && cars[tv.car].finished && phase == RP_RACE && now - tv.since > 3000) tv.until = 0;
   if (now > tv.until || (tv.mode == TV_GRID && phase != RP_GRID)) pickTvShot(now);
 
   switch (tv.mode) {
@@ -403,7 +483,7 @@ static void updateTvCam() {
         camChase(cars[tv.car], tv.tz, other);
       }
       break;
-    case TV_LEADER: case TV_EVENT:
+    case TV_LEADER: case TV_EVENT: case TV_FOLLOW:
       if (tv.car >= 0) camChase(cars[tv.car], tv.tz);
       break;
     default:
@@ -422,7 +502,7 @@ static void updateTvCam() {
 // The car the camera is on, for the highlight ring and name tag.
 static int cameraCar() {
   if (followCar >= 0) return followCar;
-  if (autoCam && (tv.mode == TV_BATTLE || tv.mode == TV_LEADER || tv.mode == TV_EVENT) && cam.zoom > 1.1f) return tv.car;
+  if (autoCam && (tv.mode == TV_BATTLE || tv.mode == TV_LEADER || tv.mode == TV_EVENT || tv.mode == TV_FOLLOW) && cam.zoom > 1.1f) return tv.car;
   return -1;
 }
 
@@ -739,14 +819,16 @@ static void drawEventTicker() {
 // ─── Buttons & panel ──────────────────────────────────────────────────────────
 static void drawTopButtons() {
   if (!uiVisible() || !stripHit(BTN[0].y, BTN[0].y + BTN[0].h)) return;
-  bool pressed[4] = { false, false, false, false };
-  if (ts.mode == TM_UI && ts.uiId >= 0 && ts.uiId < 4) pressed[ts.uiId] = true;
-  const uint32_t ic = 0xF0F4F4u;
-  drawButtonBg(BTN[0], false, pressed[0]); iconMinus(BTN[0].x + BTN[0].w / 2, BTN[0].y + BTN[0].h / 2, cam.zoom > ZOOM_MIN + 0.01f ? ic : 0x6A7A80u);
-  drawButtonBg(BTN[1], false, pressed[1]); iconPlus(BTN[1].x + BTN[1].w / 2, BTN[1].y + BTN[1].h / 2, cam.zoom < ZOOM_MAX - 0.01f ? ic : 0x6A7A80u);
+  bool pressed[NUM_TOP_BTN] = { false };
+  if (ts.mode == TM_UI && ts.uiId >= 0 && ts.uiId < NUM_TOP_BTN) pressed[ts.uiId] = true;
+  const uint32_t ic = 0xF0F4F4u, dim = 0x6A7A80u;
+  drawButtonBg(BTN[0], false, pressed[0]); iconMinus(BTN[0].x + BTN[0].w / 2, BTN[0].y + BTN[0].h / 2, !spectator && cam.zoom > ZOOM_MIN + 0.01f ? ic : dim);
+  drawButtonBg(BTN[1], false, pressed[1]); iconPlus(BTN[1].x + BTN[1].w / 2, BTN[1].y + BTN[1].h / 2, !spectator && cam.zoom < ZOOM_MAX - 0.01f ? ic : dim);
   drawButtonBg(BTN[2], hudOn, pressed[2]); iconList(BTN[2].x + BTN[2].w / 2, BTN[2].y + BTN[2].h / 2, ic);
   drawButtonBg(BTN[3], panelOpen, pressed[3]);
   iconGear(BTN[3].x + BTN[3].w / 2, BTN[3].y + BTN[3].h / 2, ic, panelOpen ? 0xB0302Au : 0x1A2026u);
+  drawButtonBg(BTN[4], spectator, pressed[4]);
+  iconTv(BTN[4].x + BTN[4].w / 2, BTN[4].y + BTN[4].h / 2 + 2, ic, spectator ? 0xB0302Au : 0x1A2026u);
 }
 
 static void drawArrowBtn(const Rect& r, bool left) {
@@ -795,6 +877,8 @@ static void drawPanel() {
   if (LAPS_OPTS[lapsIdx] == 0) snprintf(buf, sizeof(buf), "Endless"); else snprintf(buf, sizeof(buf), "%d laps", LAPS_OPTS[lapsIdx]);
   drawPanelRow(5, "Race length", buf);
   drawPanelRow(6, "Series", seriesSelName(seriesSel));
+  drawPanelRow(7, "Camera", CAM_MODE_NAMES[camMode]);
+  drawPanelRow(8, "Spectator", spectator ? "On - camera locked" : "Off - auto after 30 s");
 
   bool armed = millis() < nextRaceArmUntil;
   blendRoundRect(P_NEXT_RACE.x, P_NEXT_RACE.y, P_NEXT_RACE.w, P_NEXT_RACE.h, 10, armed ? 0xB02A20u : 0x3A4450u, 26);

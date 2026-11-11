@@ -37,8 +37,23 @@ It uses the same board setup and rendering approach as the koi pond (Desktop Aqu
 | Drag | Pan |
 | Pinch, or **−** / **+** | Zoom between the whole track (0.5×) and close-up (2.5×) |
 | ☰ (list) | Show or hide the leaderboard |
-| ⚙ (gear) | Settings: brightness, weather (Auto or forced), time (Real / Fast / Day / Night), number of cars, track (Rotate / Random / a preset), race length, series, and *Next race now* (tap twice) |
-| *(no touch for 30 s)* | **TV camera**: cuts between the whole track, the closest battle, the leader, a grandstand corner, and replays of spins |
+| 📺 (TV) | Spectator mode on or off |
+| ⚙ (gear) | Settings: brightness, weather (Auto or forced), time (Real / Fast / Day / Night), number of cars, track (Rotate / Random / a preset), race length, series, camera, spectator, and *Next race now* (tap twice) |
+| *(no touch for 30 s)* | The **TV camera** takes over again |
+
+**Camera** (in settings) picks what the TV camera shows:
+
+- **TV director** (default): cuts between the whole track, the closest battle, the leader, a random driver, a grandstand corner, and replays of spins and contact.
+- **Follow leader**: stays on whoever is leading, through lead changes.
+- **Closest battle**: the tightest fight on track, moving to a new one when it breaks up.
+- **Random driver**: rides with one car for 20–40 s, then picks another.
+- **Grandstands**: a still shot of each grandstand corner in turn.
+- **Whole track**: the full circuit, never moving. It's the smoothest, because only the rows with cars on them are redrawn.
+
+**Spectator** keeps the TV camera running permanently.
+Dragging, pinching, tapping cars and the zoom buttons are ignored, while the leaderboard, TV and settings buttons still work.
+With spectator off, touching the track takes the camera over, and the TV camera comes back after 30 s without touch.
+Pressing buttons or changing settings doesn't stop the TV camera either way.
 
 Settings are saved to flash (NVS). Car count, track and series take effect at the next race. Race length applies right away.
 

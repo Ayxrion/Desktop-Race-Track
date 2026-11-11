@@ -150,7 +150,7 @@ static void beginNextRace() {
   delay(1200);
   cam.zoom = ZOOM_MIN; cam.x = WORLD_W * 0.5f; cam.y = WORLD_H * 0.5f; cam.vx = cam.vy = 0; cam.animZoom = false;
   followCar = -1; tv.until = 0;
-  if (millis() - lastTouchMs > AUTOCAM_IDLE_MS) autoCam = true;
+  if (spectator || millis() - lastTouchMs > AUTOCAM_IDLE_MS) autoCam = true;
   updateLighting(true);
   rowHashValid = false;
 }

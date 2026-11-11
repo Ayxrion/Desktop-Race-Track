@@ -14,6 +14,13 @@ static uint8_t  lapsIdx    = 2;
 static uint8_t  seriesSel  = 0;           // 0 auto, else series + 1
 static bool     hudOn      = true;
 static uint32_t rotIdx     = 0;           // rotation counter (survives reboots)
+static uint8_t  camMode    = 0;           // which shots the TV camera takes (CamMode)
+static bool     spectator  = false;       // camera always automatic; touch can't take it over
+
+enum CamMode : uint8_t { CAM_DIRECTOR, CAM_LEADER, CAM_BATTLE, CAM_DRIVER, CAM_STANDS, CAM_TRACK, CAM_MODE_COUNT };
+static const char* const CAM_MODE_NAMES[CAM_MODE_COUNT] = {
+  "TV director", "Follow leader", "Closest battle", "Random driver", "Grandstands", "Whole track"
+};
 
 #define TRACK_MODE_COUNT  (2 + NUM_PRESETS)
 #define SERIES_SEL_COUNT  (SER_COUNT + 1)
@@ -38,7 +45,10 @@ static void loadSettings() {
   seriesSel       = prefs.getUChar("series", 0);
   hudOn           = prefs.getBool("hud", true);
   rotIdx          = prefs.getULong("rot", 0);
+  camMode         = prefs.getUChar("cam", 0);
+  spectator       = prefs.getBool("spect", false);
   prefs.end();
+  if (camMode >= CAM_MODE_COUNT) camMode = 0;
   if (weatherOverride >= WEATHER_COUNT) weatherOverride = -1;
   if (trackMode >= TRACK_MODE_COUNT) trackMode = 0;
   if (lapsIdx >= LAPS_OPT_COUNT) lapsIdx = 2;
@@ -55,6 +65,8 @@ static void saveSettings() {
   prefs.putUChar("laps", lapsIdx);
   prefs.putUChar("series", seriesSel);
   prefs.putBool("hud", hudOn);
+  prefs.putUChar("cam", camMode);
+  prefs.putBool("spect", spectator);
   prefs.end();
 }
 
