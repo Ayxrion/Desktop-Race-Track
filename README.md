@@ -20,7 +20,7 @@ It uses the same board setup and rendering approach as the koi pond (Desktop Aqu
   A move starts only with a real speed edge: closing on the car ahead, or a faster straight-line speed in its tow. Into a corner that's close, drivers go up the inside, not round the outside.
   A car that loses the tow while alongside keeps its momentum and coasts instead of braking. If it's stuck on the outside and won't be ahead by turn-in, it drops in behind.
   Drivers brake in time for a much slower car ahead, and drive round stopped or crawling cars.
-- **Close racing**: within about a second of the car ahead on a straight, a driver gets a tow that adds acceleration and top speed.
+- **Close racing**: within about a second of the car ahead, anywhere the track is flat out, a driver gets a strong tow that adds acceleration and top speed (never past what the next corner allows).
   A driver committed to a move brakes later into the next corner, and once their nose is alongside on the inside, the other car usually gives way.
   A leader with a cushion manages the gap, and every driver's form drifts a little over a race, so gaps open and close.
   A car with someone right behind is more likely to make a mistake.

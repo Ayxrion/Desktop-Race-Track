@@ -242,8 +242,8 @@ static void setupCars(int n, uint8_t series, uint32_t seed) {
 
 // ─── Racing: pace variation, tow, passing ─────────────────────────────────────
 // Traits change behaviour more than raw pace; what makes the racing close is
-// below. Tuned with the PC harness over 180 races: leader changes went from
-// 0.37 to ~1.2 a race and pole-to-win from 88% to ~56%.
+// below. Tuned with the PC harness over 180 races (16 cars, 10 laps): about 36
+// clean on-track overtakes a race, ~13 of them for the lead, ~3.6 incidents.
 #define FORM_TAU       25.0f    // s: how quickly a driver's form drifts
 #define FORM_SD        0.010f   // typical form offset (×): gaps open and close
 #define LEAD_EASE_T0   0.3f     // s: a leader further ahead than this...
@@ -252,8 +252,8 @@ static void setupCars(int n, uint8_t series, uint32_t seed) {
 #define PRESSURE_MIST  2.0f     // ...and doubles your chance of a mistake
 #define TOW_T0         0.5f     // s behind: full tow inside this
 #define TOW_T1         1.2f     // s behind: no tow beyond this
-#define TOW_GAIN       0.08f    // top-speed gain at full tow (×)
-#define TOW_ACC        0.6f     // extra acceleration at full tow and top speed (×)
+#define TOW_GAIN       0.15f    // top-speed gain at full tow (×)
+#define TOW_ACC        1.2f     // extra acceleration at full tow and top speed (×)
 #define BOXED_LEN      2.0f     // car lengths: closer than this and not passing, the tow can't be used
 #define PASS_T         0.35f    // s: a balanced driver goes for it from this far back
 #define ATTACK_COMMIT  1.015f   // how much later anyone brakes into a corner when going for a pass
@@ -261,6 +261,8 @@ static void setupCars(int n, uint8_t series, uint32_t seed) {
 #define PASS_EDGE      0.0f     // px past the clean-track limit a passing lane may use
 #define LANE_EASE      3.0f     // 1/s: lane changes slow down as they reach the new line
 #define PASS_RETRY     1.0f     // s to wait after backing out of a move
+#define CORNER_SLOW    0.65f    // a corner (for racecraft) is where the car must slow below this share of top speed
+#define FLAT_OUT       0.97f    // ...and flat out (for the tow) is anywhere it can carry this share
 #define FOLLOW_BRAKE   0.7f     // share of their braking a following driver plans to use for a slower car
 #define OBSTACLE_V     20.0f    // px/s: a car slower than this is an obstacle, not someone to race
 #define PASS_INSIDE_U  150.0f   // px: a corner closer than this means a move must go up its inside
@@ -412,12 +414,32 @@ static void updateCars(float dt, bool racing, bool coolDown) {
         if (lim < limMin) limMin = lim;
       }
       if (c.concedeT > 0) { c.concedeT -= dt; vT *= CONCEDE; }
+
+      // Where the track really slows this car, from the speed profile rather
+      // than the raw centreline curvature (noisy on the real circuits): a kink
+      // taken flat out is still part of the straight.
+      auto slowAt = [&](float sq) { return tp[idxAt(sq)].vc * sg < vTopCap * CORNER_SLOW; };
+      auto flatAt = [&](float sq) { return tp[idxAt(sq)].vc * sg >= vTopCap * FLAT_OUT; };
+      // Distance to the next corner within [u0, u1], and which way it turns
+      // (racing-line curvature at its slowest point). 1e9 if there isn't one.
+      auto nextCorner = [&](float u0, float u1, float& kOut) -> float {
+        for (float u = u0; u <= u1; u += 10.0f) {
+          if (!slowAt(c.s + u)) continue;
+          float best = 1e9f; kOut = 0;
+          for (float w = u; w <= u + 100.0f; w += 10.0f) {
+            const TrackPt& P = tp[idxAt(c.s + w)];
+            if (P.vc < best) { best = P.vc; kOut = P.rk; }
+          }
+          return u;
+        }
+        kOut = 0; return 1e9f;
+      };
       if (coolDown || c.finished) vT *= 0.6f;
       if (c.recoverT > 0) { c.recoverT -= dt; vT = fmn(vT, 45.0f); }
       // Tow: on a straight, the air behind another car is thinner. It helps from
       // about a second back and most when right under the rear wing.
       c.tow = 0;
-      if (racing && fabsf(f.k) < 1.0f / 400.0f) {
+      if (racing && flatAt(c.s)) {
         const float towRange = fmx(c.v, 60.0f) * TOW_T1;
         float towG = towRange;
         for (int j = 0; j < numCars; ++j) {
@@ -429,7 +451,7 @@ static void updateCars(float dt, bool racing, bool coolDown) {
         if (towG < towRange) {
           float tg = towG / fmx(c.v, 60.0f);          // time gap, s
           c.tow = clampf((TOW_T1 - tg) / (TOW_T1 - TOW_T0), 0, 1);
-          vT *= 1.0f + TOW_GAIN * c.tow;
+          vT = fmn(vT * (1.0f + TOW_GAIN * c.tow), sqrtf(limMin));   // never past what the corners ahead allow
         }
       }
       if (c.pressT > 0) c.pressT -= dt;
@@ -451,7 +473,7 @@ static void updateCars(float dt, bool racing, bool coolDown) {
         if (g < 0 && -g < fmx(2.5f * cs.len, o.v * PRESS_T) && o.state == CS_RACE && racing) c.pressT = 1.0f;
       }
       float dT = f.rl + (tp[idxAt(c.s + 14.0f)].rl - f.rl);
-      const bool cornerNear = fabsf(f.k) > 1.0f / 150.0f || fabsf(tp[idxAt(c.s + 45.0f)].k) > 1.0f / 150.0f;
+      const bool cornerNear = slowAt(c.s) || slowAt(c.s + 45.0f);
 
       if (ahead >= 0) {
         const Car& a = cars[ahead];
@@ -459,7 +481,7 @@ static void updateCars(float dt, bool racing, bool coolDown) {
         float gap = aheadGap - lenAvg;
         bool lapping = c.dist - a.dist > trk.L * 0.5f;
         // only a real speed edge counts: not just that they're already braking for a corner
-        const bool aAtSpeed = !a.braking && fabsf(tp[idxAt(a.s)].k) < 1.0f / 250.0f;
+        const bool aAtSpeed = !a.braking && !slowAt(a.s);
         const bool dive = T.cornerAttack && gap < lenAvg * 1.2f;
         // A real speed edge: closing on them now, or able to go faster than them
         // down this straight with the tow. (Not just that they're still
@@ -480,9 +502,9 @@ static void updateCars(float dt, bool racing, bool coolDown) {
           }
           if (roomR > 0 || roomL > 0) {
             // Which way does the next real corner go, and how far is it?
-            float kN = 0, uN = 1e9f;
-            for (float u = 30.0f; u <= 300.0f; u += 15.0f) { float k = tp[idxAt(c.s + u)].k; if (fabsf(k) > 1.0f / 150.0f) { kN = k; uN = u; break; } }
-            if (kN == 0) kN = tp[idxAt(c.s + 50.0f)].k;
+            float kN = 0;
+            const float uN = nextCorner(30.0f, 300.0f, kN);
+            if (kN == 0) kN = tp[idxAt(c.s + 50.0f)].rk;
             int inside = kN > 0 ? 1 : -1;
             float roomIn = inside > 0 ? roomR : roomL, roomOut = inside > 0 ? roomL : roomR;
             c.passSide = (roomIn > 0 && (roomIn >= roomOut - 2.0f || T.cornerAttack || uN < PASS_INSIDE_U)) ? inside : -inside;
@@ -514,8 +536,8 @@ static void updateCars(float dt, bool racing, bool coolDown) {
         }
         dT = clampf(want, -edge, edge);
         {
-          float kC = 0, uC = 60.0f;
-          for (float u = 0; u <= 60.0f; u += 15.0f) { float k = tp[idxAt(c.s + u)].k; if (fabsf(k) > 1.0f / 150.0f) { kC = k; uC = u; break; } }
+          float kC = 0, uC = nextCorner(0.0f, 60.0f, kC);
+          if (uC > 60.0f) uC = 60.0f;
           const bool outside = kC != 0 && ((kC > 0) != (c.passSide > 0));
           const float lenAvgP = (cs.len + CLS[a.cls].len) * 0.5f;
           // ...unless we are carrying enough extra speed to be ahead before turning in
@@ -529,8 +551,9 @@ static void updateCars(float dt, bool racing, bool coolDown) {
         }
         // alongside and on the inside of the next corner: the other car gives way
         {
-          float kN = tp[idxAt(c.s + 40.0f)].k;
-          bool inside = (kN > 1.0f / 300.0f && c.passSide > 0) || (kN < -1.0f / 300.0f && c.passSide < 0);
+          float kN = 0;
+          nextCorner(0.0f, 60.0f, kN);
+          bool inside = (kN > 0 && c.passSide > 0) || (kN < 0 && c.passSide < 0);
           float overlap = sDelta(a.s, c.s);           // > 0: we're ahead of them
           if (inside && overlap > -(cs.len * OVERLAP_NEED) && !TRAITS[a.trait].cornerAttack && !TRAITS[a.trait].blocks)
             cars[c.passCar].concedeT = 0.5f;
