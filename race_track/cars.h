@@ -84,6 +84,8 @@ struct Car {
   float react;              // start reaction delay (s)
   float passT; int8_t passSide; int8_t passCar;
   float passCd;             // > 0: just backed out of a move; wait before trying again
+  float passAge;            // how long the current move has been going
+  float vTop;               // its straight-line top speed (form, trait, class), without any tow
   float blockT, blockCd, yieldT; int8_t yieldSide;
   float lockT, contactCd, recoverT;
   float stopT;
@@ -259,6 +261,14 @@ static void setupCars(int n, uint8_t series, uint32_t seed) {
 #define PASS_EDGE      0.0f     // px past the clean-track limit a passing lane may use
 #define LANE_EASE      3.0f     // 1/s: lane changes slow down as they reach the new line
 #define PASS_RETRY     1.0f     // s to wait after backing out of a move
+#define FOLLOW_BRAKE   0.7f     // share of their braking a following driver plans to use for a slower car
+#define OBSTACLE_V     20.0f    // px/s: a car slower than this is an obstacle, not someone to race
+#define PASS_INSIDE_U  150.0f   // px: a corner closer than this means a move must go up its inside
+#define COAST_DECEL    20.0f    // px/s²: slowing on drag alone once out of the tow
+#define PASS_LANE      1.8f     // px of daylight the attacker aims to leave beside the other car
+#define PASS_OVERLAP   0.9f     // × car width: closer than this sideways, an attacker would hit them
+#define PASS_PULL      4.0f     // px/s: minimum rate of pulling out to pass (lane changes ease in otherwise)
+#define PASS_MAX_T     6.0f     // s: longest a move is kept going while still gaining
 #define RACE_ROOM      1.6f     // px of gap left to a car alongside...
 #define RACE_ROOM_TIGHT 0.8f    // ...or less by aggressive and defensive drivers
 #define OVERLAP_NEED   0.5f     // car lengths of overlap needed on the inside before the other car gives way
@@ -314,6 +324,8 @@ static void cornerEntry(Car& c) {
   float p = (1.0f - c.skill) * 0.09f * T.mistake * (1.0f + 2.5f * wetAmt + 3.0f * snowCover) * (c.pressT > 0 ? PRESSURE_MIST : 1.0f);
   if (frand() < p) { c.commit += frandr(0.08f, 0.24f); c.lockT = 0.35f; }  // a lapse: brakes far too late
 }
+
+static inline bool lapping0(const Car& c, const Car& a) { return c.dist - a.dist > trk.L * 0.5f; }
 
 static void startSpin(Car& c, int ci, float dir) {
   c.state = CS_SPIN;
@@ -376,6 +388,9 @@ static void updateCars(float dt, bool racing, bool coolDown) {
       }
       const float fm = 1.0f + c.form - ease;
       float vT = V_TOP * cs.top * c.perf * T.straight * fm;
+      const float vTopCap = vT;                    // straight-line target, before corners, tow and traffic
+      c.vTop = vTopCap;
+      float limMin = 1e18f;                        // (speed²) the corners ahead allow from here
       const float sg = sqrtf(gT);
       // Off the racing line (passing, defending, side by side) the car is on a
       // parallel line, tighter on the inside of a corner, so it can carry less
@@ -394,6 +409,7 @@ static void updateCars(float dt, bool racing, bool coolDown) {
         }
         float lim = vc * vc + 2.0f * ab * u;
         if (lim < vT * vT) vT = sqrtf(lim);
+        if (lim < limMin) limMin = lim;
       }
       if (c.concedeT > 0) { c.concedeT -= dt; vT *= CONCEDE; }
       if (coolDown || c.finished) vT *= 0.6f;
@@ -427,7 +443,9 @@ static void updateCars(float dt, bool racing, bool coolDown) {
         const Car& o = cars[j];
         float g = sDelta(c.s, o.s);
         float widAvg = (cs.wid + CLS[o.cls].wid) * 0.5f;
-        float latBand = (c.passT > 0 && o.state == CS_RACE) ? widAvg + 0.8f : widAvg + 1.5f;   // pulling out to pass: free once fully clear
+        // Committed to a move and pulling out: only the car it would actually hit
+        // counts as ahead, so it isn't held to their speed while drawing alongside.
+        float latBand = (c.passT > 0 && o.state == CS_RACE) ? widAvg * PASS_OVERLAP : widAvg + 1.5f;
         if (g > 0 && g < 70 && fabsf(o.d - c.d) < latBand && g < aheadGap) { ahead = j; aheadGap = g; }
         if (g < 0 && -g < 3.0f * cs.len && o.state == CS_RACE && o.passT > 0 && o.passCar == i && -g < attackGap) { attacker = j; attackGap = -g; }
         if (g < 0 && -g < fmx(2.5f * cs.len, o.v * PRESS_T) && o.state == CS_RACE && racing) c.pressT = 1.0f;
@@ -443,36 +461,49 @@ static void updateCars(float dt, bool racing, bool coolDown) {
         // only a real speed edge counts: not just that they're already braking for a corner
         const bool aAtSpeed = !a.braking && fabsf(tp[idxAt(a.s)].k) < 1.0f / 250.0f;
         const bool dive = T.cornerAttack && gap < lenAvg * 1.2f;
-        bool faster = (vFree > a.v + T.passMargin && (aAtSpeed || dive)) || a.state != CS_RACE || (lapping && vFree > a.v);
+        // A real speed edge: closing on them now, or able to go faster than them
+        // down this straight with the tow. (Not just that they're still
+        // accelerating out of the corner while our target is already higher.)
+        const float edge = fmx(c.v - a.v, vTopCap * (1.0f + TOW_GAIN * c.tow) - a.vTop);
+        bool faster = (edge > T.passMargin && (aAtSpeed || dive)) || a.state != CS_RACE || (lapping && vFree > a.v);
         bool allowed = T.cornerAttack || !cornerNear || a.state != CS_RACE || lapping;
         const float passWin = fmx(T.passGap * lenAvg, c.v * PASS_T * (T.passGap / 3.0f));
+        const bool obstacle = a.state != CS_RACE || a.v < OBSTACLE_V;   // crawling or stricken: just go round
         if (c.passT <= 0 && c.passCd <= 0 && faster && allowed && gap < passWin && racing && !coolDown) {
           const float hwP = hwC + PASS_EDGE;       // stays on the track proper
           // room either side of them, now and where their line takes them next
           float roomR = 1e9f, roomL = 1e9f;
           for (float u = 0; u <= 75.0f; u += 25.0f) {
             float ad = u == 0 ? a.d : tp[idxAt(a.s + u)].rl;
-            roomR = fmn(roomR, hwP - (ad + widAvg + 1.2f) - T.passRoom);
-            roomL = fmn(roomL, (ad - widAvg - 1.2f) + hwP - T.passRoom);
+            roomR = fmn(roomR, hwP - (ad + widAvg + PASS_LANE) - T.passRoom);
+            roomL = fmn(roomL, (ad - widAvg - PASS_LANE) + hwP - T.passRoom);
           }
           if (roomR > 0 || roomL > 0) {
-            // prefer the inside of the next corner if there's room there
-            float kN = tp[idxAt(c.s + 50.0f)].k;
+            // Which way does the next real corner go, and how far is it?
+            float kN = 0, uN = 1e9f;
+            for (float u = 30.0f; u <= 300.0f; u += 15.0f) { float k = tp[idxAt(c.s + u)].k; if (fabsf(k) > 1.0f / 150.0f) { kN = k; uN = u; break; } }
+            if (kN == 0) kN = tp[idxAt(c.s + 50.0f)].k;
             int inside = kN > 0 ? 1 : -1;
             float roomIn = inside > 0 ? roomR : roomL, roomOut = inside > 0 ? roomL : roomR;
-            c.passSide = (roomIn > 0 && (roomIn >= roomOut - 2.0f || T.cornerAttack)) ? inside : -inside;
-            c.passT = 2.5f; c.passCar = (int8_t)ahead;
+            c.passSide = (roomIn > 0 && (roomIn >= roomOut - 2.0f || T.cornerAttack || uN < PASS_INSIDE_U)) ? inside : -inside;
+            // round the outside into a corner that's close: not a real move, so wait
+            if (c.passSide != inside && uN < PASS_INSIDE_U && !lapping && !obstacle) c.passSide = 0;
+          }
+          if (c.passSide != 0 && (roomR > 0 || roomL > 0)) {
+            c.passT = 2.5f; c.passAge = 0; c.passCar = (int8_t)ahead;
             if (cornerNear) c.commit = fmx(c.commit, T.cornerAttack ? 1.03f : ATTACK_COMMIT);   // late on the brakes
           }
         }
         float fg = T.followGap * lenAvg;
         if (gap < lenAvg * BOXED_LEN && c.passT <= 0) c.tow = 0;    // boxed in: can't use the tow to accelerate
         if (gap < lenAvg * 1.5f) vT = fmn(vT, fmx(0.0f, a.v + (gap - fg) * 2.2f));
+        // and further back, brake in time for a much slower car (stopping distance)
+        else vT = fmn(vT, sqrtf(a.v * a.v + 2.0f * ab * FOLLOW_BRAKE * (gap - fg)));
       }
       if (c.passT > 0 && c.passCar >= 0) {
         const Car& a = cars[c.passCar];
         float widAvg = (cs.wid + CLS[a.cls].wid) * 0.5f;
-        const float lane = widAvg + 1.5f, edge = hwC + PASS_EDGE;
+        const float lane = widAvg + PASS_LANE, edge = hwC + PASS_EDGE;
         float want = a.dPath + c.passSide * lane;
         if (fabsf(want) > edge) {                  // they've closed that side
           float other = a.dPath - c.passSide * lane;
@@ -482,6 +513,20 @@ static void updateCars(float dt, bool racing, bool coolDown) {
           else if (sDelta(a.s, c.s) < 0) { c.passT = 0; c.passCd = PASS_RETRY; vT = fmn(vT, fmx(a.v - 3.0f, 10.0f)); }   // squeezed: lift and drop in behind
         }
         dT = clampf(want, -edge, edge);
+        {
+          float kC = 0, uC = 60.0f;
+          for (float u = 0; u <= 60.0f; u += 15.0f) { float k = tp[idxAt(c.s + u)].k; if (fabsf(k) > 1.0f / 150.0f) { kC = k; uC = u; break; } }
+          const bool outside = kC != 0 && ((kC > 0) != (c.passSide > 0));
+          const float lenAvgP = (cs.len + CLS[a.cls].len) * 0.5f;
+          // ...unless we are carrying enough extra speed to be ahead before turning in
+          const float aheadAtTurnIn = sDelta(a.s, c.s) + (c.v - a.v) * (uC / fmx(c.v, 20.0f));
+          if (outside && aheadAtTurnIn < lenAvgP * 0.3f && !lapping0(c, a) && a.state == CS_RACE && a.v >= OBSTACLE_V) {
+            // hold this lane and ease off until we are behind them; the normal
+            // rules then bring us back onto the racing line
+            c.passT = 0; c.passCd = PASS_RETRY;
+            vT = fmn(vT, fmx(a.v - 4.0f, 10.0f));
+          }
+        }
         // alongside and on the inside of the next corner: the other car gives way
         {
           float kN = tp[idxAt(c.s + 40.0f)].k;
@@ -491,6 +536,9 @@ static void updateCars(float dt, bool racing, bool coolDown) {
             cars[c.passCar].concedeT = 0.5f;
         }
         c.passT -= dt;
+        c.passAge += dt;
+        // still gaining on them and not done yet: keep going
+        if (c.passT > 0 && c.passT < 0.6f && c.passAge < PASS_MAX_T && c.v > a.v + 1.0f && sDelta(a.s, c.s) < 0) c.passT = 0.6f;
         if (sDelta(a.s, c.s) > (cs.len + CLS[a.cls].len) * 0.5f + 3.0f) c.passT = fmn(c.passT, 0.5f);   // done
         if (fabsf(sDelta(a.s, c.s)) > 90.0f) c.passT = 0;
       }
@@ -536,15 +584,20 @@ static void updateCars(float dt, bool racing, bool coolDown) {
       float oldPath = c.dPath;
       // ease into the new line: full rate when it's far, slowing as it arrives,
       // so the car settles onto it instead of overshooting at speed
-      const float laneStep = fmn(laneRate, LANE_EASE * fabsf(dT - c.dPath) + 2.0f) * dt;
+      const float laneStep = fmn(laneRate, LANE_EASE * fabsf(dT - c.dPath) + (c.passT > 0 ? PASS_PULL : 2.0f)) * dt;
       c.dPath += clampf(dT - c.dPath, -laneStep, laneStep);
       c.dPath = clampf(c.dPath, -hw - 6.0f, hw + 6.0f);
 
       // ── Longitudinal ──
       float accel = A_ACC * cs.acc * c.perf * (1.15f - 0.5f * c.v / (V_TOP * cs.top)) * wx * (c.surface == 1 ? 0.4f : (c.surface ? 0.6f : 1.0f));
       accel *= 1.0f + TOW_ACC * c.tow * clampf(c.v / (V_TOP * cs.top), 0, 1);   // drag matters more the faster you go
-      c.braking = vT < c.v - 2.0f;
+      // Faster than the straight-line target only because the tow has gone
+      // (pulling out, or drawing alongside): lift and let drag slow the car,
+      // keeping the momentum, instead of braking. Corners and traffic still brake.
+      const bool coast = c.v > vT && vT >= vTopCap * 0.995f && c.v * c.v < limMin && c.state == CS_RACE;
+      c.braking = vT < c.v - 2.0f && !coast;
       if (c.v < vT) c.v = fmn(vT, c.v + accel * dt);
+      else if (coast) c.v = fmx(vT, c.v - COAST_DECEL * dt);
       else {
         float need = (c.v - vT) / dt;
         c.v -= fmn(need, aBrkMax) * dt;
