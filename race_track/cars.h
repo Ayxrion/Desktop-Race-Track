@@ -1287,8 +1287,10 @@ static int nearestCar(float wx, float wy, float maxD) {
 }
 
 // ─── Drawing ──────────────────────────────────────────────────────────────────
-struct CarDraw { float sx, sy, ca, sa, hl, hwd; int y0, y1; bool vis; };
+struct CarDraw { float sx, sy, ca, sa, hl, hwd; int y0, y1; bool vis; uint32_t l1, l2, l3; };   // l1..l3: livery, lit
 static CarDraw cdraw[MAX_CARS];
+// Shared car colours, lit for this frame (worked out once, not in every strip)
+static uint32_t litTyre, litGlass, litDark, litLamp, litWhite, litRack;
 
 static void prepareCarsFrame() {
   const float z = cam.zoom;
@@ -1304,7 +1306,10 @@ static void prepareCarsFrame() {
     float beam = nightAmt > 0.3f ? cs.len * 2.6f * z : 0;
     d.y0 = (int)(d.sy - R - beam) - 2; d.y1 = (int)(d.sy + R + beam + 3 * z) + 2;
     d.vis = d.sx + R + beam >= 0 && d.sx - R - beam < SCREEN_W && d.y1 >= 0 && d.y0 < SCREEN_H;
+    if (d.vis) { d.l1 = litT(c.c1); d.l2 = litT(c.c2); d.l3 = litT(c.c3); }
   }
+  litTyre = litT(0x1A1A1Cu); litGlass = litT(0x1C2A38u); litDark = litT(0x101012u);
+  litLamp = litT(0xF0F0D8u); litWhite = litT(0xF4F4F4u); litRack = litT(0x2A2E34u);
 }
 
 // Local car coordinates: x forward, y to the right, both normalised to ±1.
@@ -1360,8 +1365,8 @@ static void IRAM_ATTR drawHeadlights() {
 static void IRAM_ATTR drawCarBody(int i) {
   const Car& c = cars[i];
   const CarDraw& d = cdraw[i];
-  const uint32_t c1 = litT(c.c1), c2 = litT(c.c2), c3 = litT(c.c3);
-  const uint32_t tyre = litT(0x1A1A1Cu), glass = litT(0x1C2A38u), dark = litT(0x101012u);
+  const uint32_t c1 = d.l1, c2 = d.l2, c3 = d.l3;
+  const uint32_t tyre = litTyre, glass = litGlass, dark = litDark;
   const float lenPx = d.hl * 2;
 
   if (lenPx < 10.0f) {                     // far away: a coloured dash with an accent
@@ -1390,7 +1395,7 @@ static void IRAM_ATTR drawCarBody(int i) {
       cQuad(d, -0.15f, 0.45f, -0.42f, 0.42f, glass);            // canopy
       cQuad(d, -0.95f, -0.15f, -0.06f, 0.06f, c2);              // fin
       cQuad(d, -1.0f, -0.86f, -1.0f, 1.0f, c2);                 // rear wing
-      cQuad(d, 0.86f, 0.98f, 0.45f, 0.78f, litT(0xF0F0D8u)); cQuad(d, 0.86f, 0.98f, -0.78f, -0.45f, litT(0xF0F0D8u));
+      cQuad(d, 0.86f, 0.98f, 0.45f, 0.78f, litLamp); cQuad(d, 0.86f, 0.98f, -0.78f, -0.45f, litLamp);
       break;
     case CC_GT:
       cQuad(d, -1.0f, 0.78f, -1.0f, 1.0f, c1);
@@ -1402,16 +1407,16 @@ static void IRAM_ATTR drawCarBody(int i) {
       cQuad(d, -0.42f, 0.08f, -0.18f, 0.18f, c2);
       cQuad(d, -0.62f, -0.42f, -0.7f, 0.7f, glass);             // rear window
       cQuad(d, -0.99f, -0.86f, -0.95f, 0.95f, dark);            // rear wing
-      cQuad(d, 0.92f, 1.0f, 0.5f, 0.8f, litT(0xF0F0D8u)); cQuad(d, 0.92f, 1.0f, -0.8f, -0.5f, litT(0xF0F0D8u));
+      cQuad(d, 0.92f, 1.0f, 0.5f, 0.8f, litLamp); cQuad(d, 0.92f, 1.0f, -0.8f, -0.5f, litLamp);
       break;
     case CC_TOURING:
       cQuad(d, -1.0f, 1.0f, -1.0f, 1.0f, c1);
       cQuad(d, 0.18f, 0.38f, -0.80f, 0.80f, glass);
       cQuad(d, -0.38f, 0.18f, -0.82f, 0.82f, c2);               // two-tone roof
       cQuad(d, -0.58f, -0.38f, -0.78f, 0.78f, glass);
-      { int rx, ry; carPt(d, -0.1f, 0, rx, ry); fCircle(rx, ry, (int)fmx(1, d.hwd * 0.35f), litT(0xF4F4F4u)); }
+      { int rx, ry; carPt(d, -0.1f, 0, rx, ry); fCircle(rx, ry, (int)fmx(1, d.hwd * 0.35f), litWhite); }
       cQuad(d, 0.6f, 0.98f, 0.85f, 1.0f, c3); cQuad(d, 0.6f, 0.98f, -1.0f, -0.85f, c3);
-      cQuad(d, 0.94f, 1.0f, 0.5f, 0.85f, litT(0xF0F0D8u)); cQuad(d, 0.94f, 1.0f, -0.85f, -0.5f, litT(0xF0F0D8u));
+      cQuad(d, 0.94f, 1.0f, 0.5f, 0.85f, litLamp); cQuad(d, 0.94f, 1.0f, -0.85f, -0.5f, litLamp);
       break;
     case CC_VAN:   // panel van: short sloping bonnet, long flat roof
       cQuad(d, -1.0f, 0.62f, -1.0f, 1.0f, c1);
@@ -1419,11 +1424,11 @@ static void IRAM_ATTR drawCarBody(int i) {
       cTri(d, 0.62f, -1.0f, 1.0f, 0.82f, 0.62f, 1.0f, c1);
       cQuad(d, 0.46f, 0.64f, -0.86f, 0.86f, glass);             // windscreen
       cQuad(d, -0.94f, 0.42f, -0.30f, 0.30f, c2);               // roof stripe
-      cQuad(d, -0.72f, -0.62f, -0.88f, 0.88f, litT(0x2A2E34u)); // roof-rack bars
-      cQuad(d, -0.30f, -0.20f, -0.88f, 0.88f, litT(0x2A2E34u));
+      cQuad(d, -0.72f, -0.62f, -0.88f, 0.88f, litRack); // roof-rack bars
+      cQuad(d, -0.30f, -0.20f, -0.88f, 0.88f, litRack);
       cQuad(d, -1.0f, -0.96f, -0.03f, 0.03f, dark);             // split rear doors
-      { int rx, ry; carPt(d, 0.12f, 0, rx, ry); fCircle(rx, ry, (int)fmx(1, d.hwd * 0.34f), litT(0xF4F4F4u)); }
-      cQuad(d, 0.94f, 1.0f, 0.55f, 0.86f, litT(0xF0F0D8u)); cQuad(d, 0.94f, 1.0f, -0.86f, -0.55f, litT(0xF0F0D8u));
+      { int rx, ry; carPt(d, 0.12f, 0, rx, ry); fCircle(rx, ry, (int)fmx(1, d.hwd * 0.34f), litWhite); }
+      cQuad(d, 0.94f, 1.0f, 0.55f, 0.86f, litLamp); cQuad(d, 0.94f, 1.0f, -0.86f, -0.55f, litLamp);
       break;
     default:   // CC_CLASSIC — cigar-shaped single-seater
       cWheels(d, 0.35f, 0.65f, -0.68f, -0.32f, 0.62f, tyre);
@@ -1433,7 +1438,7 @@ static void IRAM_ATTR drawCarBody(int i) {
       cTri(d, -0.7f, -0.46f, -1.0f, 0.2f, -0.7f, 0.46f, c1);
       cQuad(d, -0.35f, -0.05f, -0.26f, 0.26f, dark);
       { int hx, hy; carPt(d, -0.22f, 0, hx, hy); fCircle(hx, hy, (int)fmx(1, d.hwd * 0.24f), c3); }
-      { int rx, ry; carPt(d, 0.52f, 0, rx, ry); fCircle(rx, ry, (int)fmx(1, d.hwd * 0.22f), litT(0xF4F4F4u)); }
+      { int rx, ry; carPt(d, 0.52f, 0, rx, ry); fCircle(rx, ry, (int)fmx(1, d.hwd * 0.22f), litWhite); }
       if (lenPx > 22) cQuad(d, 0.0f, 0.95f, -0.08f, 0.08f, c2);
       break;
   }

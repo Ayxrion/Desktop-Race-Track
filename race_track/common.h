@@ -313,11 +313,14 @@ static void IRAM_ATTR fTri(int x0, int y0, int x1, int y1, int x2, int y2, uint3
   uint16_t c = toPx(rgbTo565(col));
   if (y0 == y2) { fSpan(y0, mnx, mxx, c); return; }
   int ys = y0 > clipY0 ? y0 : clipY0, ye = y2 < clipY1 - 1 ? y2 : clipY1 - 1;
-  float inv02 = (float)(x2 - x0) / (y2 - y0);
+  // edge slopes, once per triangle (a divide per row is slow on the ESP32)
+  const float inv02 = (float)(x2 - x0) / (y2 - y0);
+  const float inv01 = y1 != y0 ? (float)(x1 - x0) / (y1 - y0) : 0.0f;
+  const float inv12 = y2 != y1 ? (float)(x2 - x1) / (y2 - y1) : 0.0f;
   for (int y = ys; y <= ye; ++y) {
     float xa = x0 + (y - y0) * inv02, xb;
-    if (y < y1 || y1 == y2) xb = (y1 == y0) ? (float)x1 : x0 + (y - y0) * (float)(x1 - x0) / (y1 - y0);
-    else                    xb = x1 + (y - y1) * (float)(x2 - x1) / (y2 - y1);
+    if (y < y1 || y1 == y2) xb = (y1 == y0) ? (float)x1 : x0 + (y - y0) * inv01;
+    else                    xb = x1 + (y - y1) * inv12;
     int a = (int)iround(xa), b = (int)iround(xb);
     if (a > b) { int t = a; a = b; b = t; }
     fSpan(y, a, b, c);
@@ -387,11 +390,14 @@ static void IRAM_ATTR blendTri(int x0, int y0, int x1, int y1, int x2, int y2, u
   uint16_t c = rgbTo565(col);
   if (y0 == y2) { blendSpan(y0, mnx, mxx, c, alpha); return; }
   int ys = y0 > clipY0 ? y0 : clipY0, ye = y2 < clipY1 - 1 ? y2 : clipY1 - 1;
-  float inv02 = (float)(x2 - x0) / (y2 - y0);
+  // edge slopes, once per triangle (a divide per row is slow on the ESP32)
+  const float inv02 = (float)(x2 - x0) / (y2 - y0);
+  const float inv01 = y1 != y0 ? (float)(x1 - x0) / (y1 - y0) : 0.0f;
+  const float inv12 = y2 != y1 ? (float)(x2 - x1) / (y2 - y1) : 0.0f;
   for (int y = ys; y <= ye; ++y) {
     float xa = x0 + (y - y0) * inv02, xb;
-    if (y < y1 || y1 == y2) xb = (y1 == y0) ? (float)x1 : x0 + (y - y0) * (float)(x1 - x0) / (y1 - y0);
-    else                    xb = x1 + (y - y1) * (float)(x2 - x1) / (y2 - y1);
+    if (y < y1 || y1 == y2) xb = (y1 == y0) ? (float)x1 : x0 + (y - y0) * inv01;
+    else                    xb = x1 + (y - y1) * inv12;
     int a = iround(xa), b = iround(xb);
     if (a > b) { int t = a; a = b; b = t; }
     blendSpan(y, a, b, c, alpha);
