@@ -25,6 +25,15 @@
 #define A_LAT   70.0f      // cornering grip: v = sqrt(A_LAT / |k|)
 #define A_BRK   115.0f
 #define A_ACC   55.0f
+#ifndef RT_ROUND_M
+#define RT_ROUND_M 2.0f          // preset corners are rounded to at least half the road width plus this (px radius)
+#endif
+#ifndef RL_EDGE
+#define RL_EDGE 4.0f             // px from the edge the racing line keeps
+#endif
+#ifndef RL_CURV_ITERS
+#define RL_CURV_ITERS 25         // minimum-curvature passes per scale when building the racing line
+#endif
 
 // Fit box for the circuit. The strip on the left stays free so the leaderboard
 // doesn't cover the track at the whole-track zoom.
@@ -47,7 +56,10 @@ struct TrackPt {
   uint8_t run[2];    // run-off surface: 0 grass, 1 gravel, 2 tarmac
 };
 
-struct Corner   { int i0, i1, apex; int8_t dir; float vMin; };
+// A corner: where it bends (i0..i1, apex at the tightest point) and, for the
+// drivers' own lines, where they turn in (sIn), apex (sAp) and track out (sOut).
+// sIn/sOut may lie outside [0, L): compare them with sDelta().
+struct Corner   { int i0, i1, apex; int8_t dir; float vMin; float sIn, sAp, sOut, q; };
 struct Stand    { float sc, half, d0, d1; int8_t side; uint8_t roofHue; };   // centred at sc, on side 0/1
 struct LightPos { int16_t x, y; };
 
@@ -68,13 +80,15 @@ static Track    trk;
 static TrackPt* tp = nullptr;            // trk.n samples, PSRAM
 static float*   _tmpA = nullptr;         // scratch buffers for generation (PSRAM)
 static float*   _tmpB = nullptr;
+static float*   _tmpC = nullptr;         // 3 × MAX_SAMPLES, for rounding off preset corners (PSRAM)
 #define TMP_N 4096
 
 static bool allocTrack() {
   tp    = (TrackPt*)heap_caps_malloc(sizeof(TrackPt) * MAX_SAMPLES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   _tmpA = (float*)heap_caps_malloc(sizeof(float) * TMP_N, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   _tmpB = (float*)heap_caps_malloc(sizeof(float) * TMP_N, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  return tp && _tmpA && _tmpB;
+  _tmpC = (float*)heap_caps_malloc(sizeof(float) * 3 * MAX_SAMPLES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  return tp && _tmpA && _tmpB && _tmpC;
 }
 
 // ─── Lookups ──────────────────────────────────────────────────────────────────
@@ -242,6 +256,26 @@ static void computeRacingLine() {
       }
     }
   }
+  // That alone is a taut string: the shortest way round, which wraps the inside
+  // kerb of a hairpin far too tightly (half the centreline's radius). Now relax
+  // each point's bend toward its neighbours' (a biharmonic step), which spreads
+  // the turn over the whole width: wide in, late apex, wide out.
+  auto lx = [&](int j) { return tp[j].x - tp[j].ty * o[j]; };
+  auto ly = [&](int j) { return tp[j].y + tp[j].tx * o[j]; };
+  const float lim2 = trk.hw - RL_EDGE;            // a little more margin: this line uses the edges all through a corner
+  for (int i = 0; i < n; ++i) o[i] = clampf(o[i], -lim2, lim2);
+  const int steps2[] = { 16, 8, 4, 2, 1 };
+  for (int si = 0; si < 5; ++si) {
+    const int st = steps2[si];
+    for (int it = 0; it < RL_CURV_ITERS; ++it) {
+      for (int i = 0; i < n; ++i) {
+        const int j0 = wrapI(i - 2 * st), j1 = wrapI(i - st), j3 = wrapI(i + st), j4 = wrapI(i + 2 * st);
+        float mx = (-lx(j0) + 4 * lx(j1) + 4 * lx(j3) - lx(j4)) * (1.0f / 6.0f) - lx(i);
+        float my = (-ly(j0) + 4 * ly(j1) + 4 * ly(j3) - ly(j4)) * (1.0f / 6.0f) - ly(i);
+        o[i] = clampf(o[i] + (mx * -tp[i].ty + my * tp[i].tx) * 0.6f, -lim2, lim2);
+      }
+    }
+  }
   for (int i = 0; i < n; ++i) tp[i].rl = o[i];
 }
 
@@ -326,6 +360,19 @@ static void computeCorners() {
       c.i0 = ii; c.i1 = wrapI(start + j - 1); c.apex = apex; c.dir = (int8_t)dir; c.vMin = vMin;
     }
     i = j > i ? j : i + 1;
+  }
+  // Shapes for the drivers' lines: turn-in a little before the bend starts,
+  // track-out a little after it ends, and an apex window either side of the apex.
+  for (int k = 0; k < trk.nCorners; ++k) {
+    Corner& c = trk.corners[k];
+    float s0 = c.i0 * trk.ds, s1 = s0 + wrapS(c.i1 * trk.ds - s0), len = fmx(s1 - s0, trk.ds);
+    float sa = s0 + wrapS(c.apex * trk.ds - s0);
+    c.sIn = s0 - clampf(0.4f * len, 15.0f, 60.0f);
+    c.sOut = s1 + clampf(0.5f * len, 20.0f, 80.0f);
+    c.sAp = sa;
+    c.q = clampf(0.3f * len, 8.0f, 50.0f);
+    if (c.sAp - c.q < c.sIn + 6.0f) c.q = fmx(4.0f, c.sAp - c.sIn - 6.0f);
+    if (c.sAp + c.q > c.sOut - 6.0f) c.q = fmn(c.q, fmx(4.0f, c.sOut - c.sAp - 6.0f));
   }
 }
 
@@ -562,12 +609,61 @@ static void finishTrack() {
                 trk.name, trk.L, trk.n, trk.W, trk.nCorners, trk.nStands, (int)trk.hasPits);
 }
 
+// A few preset corners are tighter than the road is wide, so the inner edge folds
+// over itself and no line through them is smooth (cars all but stopped there).
+// Round them off, a little at a time, until the road fits.
+static void resampleEven() {           // even spacing again (everything else assumes trk.ds between samples)
+  const int n = trk.n;
+  float* bx = _tmpC; float* by = _tmpC + MAX_SAMPLES; float* acc = _tmpC + 2 * MAX_SAMPLES;
+  for (int i = 0; i < n; ++i) { bx[i] = tp[i].x; by[i] = tp[i].y; }
+  float L = 0;
+  for (int i = 0; i < n; ++i) { int j = wrapI(i + 1); acc[i] = L; L += sqrtf((bx[j] - bx[i]) * (bx[j] - bx[i]) + (by[j] - by[i]) * (by[j] - by[i])); }
+  trk.L = L; trk.ds = L / n;
+  int j = 0;
+  for (int i = 0; i < n; ++i) {
+    const float s = i * trk.ds;
+    while (j < n - 1 && acc[j + 1] < s) ++j;
+    const int jn = wrapI(j + 1);
+    const float segL = (j + 1 < n ? acc[j + 1] : L) - acc[j];
+    const float t = segL > 1e-6f ? clampf((s - acc[j]) / segL, 0, 1) : 0;
+    tp[i].x = bx[j] + (bx[jn] - bx[j]) * t;
+    tp[i].y = by[j] + (by[jn] - by[j]) * t;
+  }
+}
+static void roundTightCorners(float kMax) {
+  const int n = trk.n, st = 3;
+  float* bx = _tmpC; float* by = _tmpC + MAX_SAMPLES; float* kr = _tmpC + 2 * MAX_SAMPLES;
+  for (int pass = 0; pass < 120; ++pass) {
+    // raw bend over ~10 px of road: the smoothed curvature hides how sharp a kink is
+    float worst = 0;
+    for (int i = 0; i < n; ++i) {
+      const TrackPt& a = tp[wrapI(i - 2)]; const TrackPt& m = tp[i]; const TrackPt& b = tp[wrapI(i + 2)];
+      float h0 = atan2f(m.y - a.y, m.x - a.x), h1 = atan2f(b.y - m.y, b.x - m.x);
+      kr[i] = wrapAngle(h1 - h0) / (2.0f * trk.ds);
+      worst = fmx(worst, fabsf(kr[i]));
+    }
+    if (worst <= kMax) break;
+    for (int i = 0; i < n; ++i) { bx[i] = tp[i].x; by[i] = tp[i].y; }
+    for (int i = 0; i < n; ++i) {
+      bool hot = false;
+      for (int k = -3 * st; k <= 3 * st && !hot; ++k) hot = fabsf(kr[wrapI(i + k)]) > kMax;
+      if (!hot) continue;
+      const int a = wrapI(i - st), b = wrapI(i + st);
+      tp[i].x = bx[i] * 0.5f + (bx[a] + bx[b]) * 0.25f;
+      tp[i].y = by[i] * 0.5f + (by[a] + by[b]) * 0.25f;
+    }
+    resampleEven();
+  }
+  computeFrames();
+}
+
 static void buildPresetTrack(int p) {
   float px[PRESET_PTS], py[PRESET_PTS];
   for (int i = 0; i < PRESET_PTS; ++i) { px[i] = PRESETS[p].pts[i * 2]; py[i] = PRESETS[p].pts[i * 2 + 1]; }
   fitControl(px, py, PRESET_PTS, true);
   buildCenterline(px, py, PRESET_PTS);
   computeFrames();
+  roundTightCorners(1.0f / (TRACK_W_DEF * 0.5f + RT_ROUND_M));
   float minClr = computeClearance();
   trk.W = clampf(minClr * 0.55f, 15.0f, TRACK_W_DEF);
   trk.preset = p; trk.seed = 0x5EED0000u + p;

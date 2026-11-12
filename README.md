@@ -17,9 +17,16 @@ It uses the same board setup and rendering approach as the koi pond (Desktop Aqu
   Drivers plan their own braking points, pick the inside or outside to pass, race side by side, and sometimes make contact.
   They leave racing room for a car alongside instead of steering into it, pick the side that stays open along the next stretch, and back out of a move that's being closed down.
   Lane changes ease in, so a car settles onto its new line instead of running wide onto the grass.
-  A move starts only with a real speed edge: closing on the car ahead, or a faster straight-line speed in its tow. Into a corner that's close, drivers go up the inside, not round the outside.
-  A car that loses the tow while alongside keeps its momentum and coasts instead of braking. If it's stuck on the outside and won't be ahead by turn-in, it drops in behind.
+  A move starts with a real speed edge (closing on the car ahead, or a faster straight-line speed in its tow), or, right on someone's gearbox into a corner, as a deliberate move round the outside.
+  A car that loses the tow while alongside keeps its momentum and coasts instead of braking.
   Drivers brake in time for a much slower car ahead, and drive round stopped or crawling cars.
+- **The racing line** is a minimum-curvature line that uses the whole width of the road: wide in, late apex, wide out.
+  A few preset corners that are tighter than the road is wide are rounded off so there's always a smooth way through.
+- **Each driver's own line**: drivers vary the racing line through every corner (earlier or later apex, more or less kerb, wider or tighter on entry and exit), and change it lap to lap.
+  Braking harder than they're comfortable with, or getting on the throttle too early, uses up grip the tyres need for turning, so a greedy driver runs wide or snaps into oversteer.
+  Close behind another car in a corner the dirty air costs grip. Drivers cover the inside when someone's on their tail, switch back underneath on the exit, and try round the outside, where the car on the inside has to leave room and loses a little exit speed.
+  Side by side, a driver plans its speed for the path it's really on (beside the other car or along the kerb), and an attacker carries a little more than is comfortable.
+  The classic AI (everyone on the one racing line) is still in the code: set `aiLines` to `false` in `cars.h`.
 - **Close racing**: within about a second of the car ahead, anywhere the track is flat out, a driver gets a strong tow that adds acceleration and top speed (never past what the next corner allows).
   A driver committed to a move brakes later into the next corner, and once their nose is alongside on the inside, the other car usually gives way.
   A leader with a cushion manages the gap, and every driver's form drifts a little over a race, so gaps open and close.
