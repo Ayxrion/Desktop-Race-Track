@@ -461,6 +461,8 @@ static void setupCars(int n, uint8_t series, uint32_t seed) {
 #define LEAD_EASE      0.015f   // ...backs off by up to this much (×), managing the gap
 #define PRESS_T        0.8f     // s: a car this close behind puts you under pressure...
 #define PRESSURE_MIST  2.0f     // ...and doubles your chance of a mistake
+#define COVER_T        0.35f    // s: only a car this close behind, and at least as quick, makes a driver cover the inside
+#define COVER_CD       10.0f    // s: and not again for this long
 #define TOW_T0         0.5f     // s behind: full tow inside this
 #define TOW_T1         1.2f     // s behind: no tow beyond this
 #define TOW_GAIN       0.15f    // top-speed gain at full tow (×)
@@ -802,6 +804,7 @@ static void updateCars(float dt, bool racing, bool coolDown) {
       // ── Traffic ──
       int ahead = -1; float aheadGap = 1e9f;
       int attacker = -1; float attackGap = 1e9f;
+      int behind = -1; float behindGap = 1e9f;
       for (int j = 0; j < numCars; ++j) {
         if (j == i) continue;
         const Car& o = cars[j];
@@ -813,6 +816,7 @@ static void updateCars(float dt, bool racing, bool coolDown) {
         if (g > 0 && g < 70 && fabsf(o.d - c.d) < latBand && g < aheadGap) { ahead = j; aheadGap = g; }
         if (g < 0 && -g < 3.0f * cs.len && o.state == CS_RACE && o.passT > 0 && o.passCar == i && -g < attackGap) { attacker = j; attackGap = -g; }
         if (g < 0 && -g < fmx(2.5f * cs.len, o.v * PRESS_T) && o.state == CS_RACE && racing) c.pressT = 1.0f;
+        if (g < 0 && -g < behindGap && o.state == CS_RACE && fabsf(o.d - c.d) < widAvg + 6.0f) { behind = j; behindGap = -g; }
       }
       float dT = aiLines ? lineCurD(lcOwn, 14.0f, tpU(fi0, 14.0f)) :f.rl + (tp[idxAt(c.s + 14.0f)].rl - f.rl);
       const bool cornerNear = slowU(0.0f) || slowU(45.0f);
@@ -948,10 +952,13 @@ static void updateCars(float dt, bool racing, bool coolDown) {
           c.blockT = 1.0f; c.blockCd = 5.0f;
         }
       }
-      if (aiLines && racing && !coolDown && c.state == CS_RACE && c.pressT > 0 && c.coverT <= 0 && c.blockCd <= 0) {
-        // Someone on our tail with a corner coming: maybe move over to cover the inside (once).
+      const bool threat = behind >= 0 && behindGap - (cs.len + CLS[cars[behind].cls].len) * 0.5f < cars[behind].v * COVER_T && cars[behind].v > c.v - 3.0f;
+      if (aiLines && racing && !coolDown && c.state == CS_RACE && threat && c.coverT <= 0 && c.blockCd <= 0) {
+        // A car right on our tail, and at least as quick, with a corner coming: maybe cover the
+        // inside up to the turn-in. (Covering for anyone close, and holding it through the exit,
+        // left a whole queue on slow inside lines while the leaders got away in long races.)
         float kq = 0; const float uq = nextCorner(40.0f, 160.0f, kq);
-        if (uq < 1e8f && kq != 0 && frand() < coverRateOf(c.trait) * dt) { c.coverT = fmn(2.5f, uq / fmx(c.v, 30.0f) + 0.6f); c.blockCd = 6.0f; c.coverSide = kq > 0 ? 1 : -1; }
+        if (uq < 1e8f && kq != 0 && frand() < coverRateOf(c.trait) * dt) { c.coverT = fmn(1.6f, uq / fmx(c.v, 30.0f) + 0.15f); c.blockCd = COVER_CD; c.coverSide = kq > 0 ? 1 : -1; }
       }
       if (c.coverT > 0) { c.coverT -= dt; dT = c.coverSide * (hwC - 1.5f); }
       if (c.yieldT > 0) { c.yieldT -= dt; dT = c.yieldSide * hwC * 0.75f; vT = fmn(vT, vFree * 0.97f); }
