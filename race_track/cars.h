@@ -309,6 +309,7 @@ static float simInvDs = 1.0f;
 #define PLAN_ALT 1                                // full corner plans on alternate steps
 #endif
 static uint32_t simTick = 0;                     // sim steps, for spreading work over alternate steps
+static bool towBoxed[MAX_CARS];                  // boxed in behind a car: the tow can't be used to accelerate
 static inline const TrackPt& tpU(float fi0, float u) {
   float fi = fi0 + u * simInvDs;
   if (fi < 0) fi += trk.n; else if (fi >= trk.n) fi -= trk.n;
@@ -421,7 +422,7 @@ static void setupCars(int n, uint8_t series, uint32_t seed) {
     c.react = frandr(0.05f, 0.45f) * (c.trait == TR_AGGRESSIVE ? 0.7f : (c.trait == TR_PATIENT ? 1.3f : 1.0f));
     c.commit = 1.0f;
     const TraitSpec& T = TRAITS[c.trait];
-    quali[i] = c.perf * CLS[c.cls].top * (1.0f + 0.3f * (sqrtf(T.corner) - 1.0f)) + frandr(-0.015f, 0.015f);   // one hot lap
+    quali[i] = frandr(-0.015f, 0.015f);   // no qualifying: a random grid, so pole is no head start for the quickest
   }
   int gridOrd[MAX_CARS];
   for (int i = 0; i < numCars; ++i) gridOrd[i] = i;
@@ -459,6 +460,11 @@ static void setupCars(int n, uint8_t series, uint32_t seed) {
 #define FORM_SD        0.010f   // typical form offset (×): gaps open and close
 #define LEAD_EASE_T0   0.3f     // s: a leader further ahead than this...
 #define LEAD_EASE      0.015f   // ...backs off by up to this much (×), managing the gap
+// Pack racing (new AI): anyone can win from anywhere on the grid. Further back means more
+// speed down the straights (corners stay within grip), and a move down a straight gets a push.
+#define PACK_K         0.02f    // top speed (×) for a car PACK_T s or more behind the leader...
+#define PACK_T         5.0f
+#define POS_K          0.05f    // ...plus up to this much (×) by position, the most for last place
 #define PRESS_T        0.8f     // s: a car this close behind puts you under pressure...
 #define PRESSURE_MIST  2.0f     // ...and doubles your chance of a mistake
 #define COVER_T        0.35f    // s: only a car this close behind, and at least as quick, makes a driver cover the inside
@@ -467,6 +473,9 @@ static void setupCars(int n, uint8_t series, uint32_t seed) {
 #define TOW_T1         1.2f     // s behind: no tow beyond this
 #define TOW_GAIN       0.15f    // top-speed gain at full tow (×)
 #define TOW_ACC        1.2f     // extra acceleration at full tow and top speed (×)
+#define PASS_PUSH      0.07f    // push to pass: top speed (×) while making a move down a straight...
+#define PASS_PUSH_ACC  1.0f     // ...and extra acceleration (×)
+#define TOW_HOLD       2.5f     // s: pulling out of the tow to pass, the speed it gave fades over this long
 #define BOXED_LEN      2.0f     // car lengths: closer than this and not passing, the tow can't be used
 #define PASS_T         0.35f    // s: a balanced driver goes for it from this far back
 #define ATTACK_COMMIT  1.015f   // how much later anyone brakes into a corner when going for a pass
@@ -474,6 +483,7 @@ static void setupCars(int n, uint8_t series, uint32_t seed) {
 #define PASS_EDGE      0.0f     // px past the clean-track limit a passing lane may use
 #define LANE_EASE      3.0f     // 1/s: lane changes slow down as they reach the new line
 #define PASS_RETRY     1.0f     // s to wait after backing out of a move
+#define REPASS_CD      4.0f     // s: just passed, a driver has to get back in the tow before attacking again
 #define OUTSIDE_GAP    0.6f     // car lengths behind: close enough to try round the outside in a corner
 #define OUTSIDE_RATE_K 1.0f     // scales every driver's appetite for the outside
 #define OUTSIDE_GAIN   1.06f    // a committed attacker on a wider arc carries up to this much more speed
@@ -653,8 +663,15 @@ static void updateCars(float dt, bool racing, bool coolDown) {
         float gapT = (c.dist - b.dist) / fmx(c.v, 60.0f);
         ease = LEAD_EASE * clampf((gapT - LEAD_EASE_T0) / 1.0f, 0, 1);
       }
+      float pack = 0;
+      if (aiLines && racing && c.pos > 1 && !c.finished && raceTime > 5.0f) {
+        const Car& L = cars[order[0]];
+        const float avgV = fmx(L.dist / raceTime, 50.0f);           // the leader's average speed so far
+        pack = PACK_K * clampf((L.dist - c.dist) / avgV / PACK_T, 0, 1);
+        pack += POS_K * (c.pos - 1) / fmx(numCars - 1, 1);   // the further back, the more they find
+      }
       const float fm = 1.0f + c.form - ease;
-      float vT = V_TOP * cs.top * c.perf * T.straight * fm;
+      float vT = V_TOP * cs.top * c.perf * T.straight * fm * (1.0f + pack);   // catching up: more speed down the straights
       const float vTopCap = vT;                    // straight-line target, before corners, tow and traffic
       c.vTop = vTopCap;
       float limMin = 1e18f;                        // (speed²) the corners ahead allow from here
@@ -781,7 +798,11 @@ static void updateCars(float dt, bool racing, bool coolDown) {
       if (coolDown || c.finished) vT *= 0.6f;
       if (c.recoverT > 0) { c.recoverT -= dt; vT = fmn(vT, 45.0f); }
       // Tow: on a straight, the air behind another car is thinner. It helps from
-      // about a second back and most when right under the rear wing.
+      // about a second back and most when right under the rear wing, but only in
+      // line behind them: a car alongside gets none (or two cars side by side would
+      // leapfrog each other all the way down a straight).
+      const float towPrev = c.tow;
+      towBoxed[i] = false;
       c.tow = 0;
       if (racing && tpU(fi0, 0.0f).vc * sg >= vTopCap * FLAT_OUT) {
         const float towRange = fmx(c.v, 60.0f) * TOW_T1;
@@ -790,13 +811,15 @@ static void updateCars(float dt, bool racing, bool coolDown) {
           if (j == i) continue;
           const Car& o = cars[j];
           float g = sDelta(c.s, o.s);
-          if (g > 4.0f && g < towG && fabsf(o.d - c.d) < hw * 0.8f && o.state == CS_RACE) towG = g;
+          if (g > cs.len && g < towG && fabsf(o.d - c.d) < (cs.wid + CLS[o.cls].wid) * 0.5f + 2.0f && o.state == CS_RACE) towG = g;
         }
         if (towG < towRange) {
           float tg = towG / fmx(c.v, 60.0f);          // time gap, s
           c.tow = clampf((TOW_T1 - tg) / (TOW_T1 - TOW_T0), 0, 1);
-          vT = fmn(vT * (1.0f + TOW_GAIN * c.tow), sqrtf(limMin));   // never past what the corners ahead allow
         }
+        if (c.passT > 0) c.tow = fmx(c.tow, towPrev - dt / TOW_HOLD);   // pulling out to pass carries the speed for a while
+        if (c.tow > 0) vT = fmn(vT * (1.0f + TOW_GAIN * c.tow), sqrtf(limMin));   // never past what the corners ahead allow
+        if (c.passT > 0 && c.passCar >= 0) vT = fmn(vT * (1.0f + PASS_PUSH), sqrtf(limMin));   // push to pass
       }
       if (c.pressT > 0) c.pressT -= dt;
       const float vFree = vT;                      // before traffic
@@ -871,7 +894,7 @@ static void updateCars(float dt, bool racing, bool coolDown) {
           }
         }
         float fg = T.followGap * lenAvg;
-        if (gap < lenAvg * BOXED_LEN && c.passT <= 0) c.tow = 0;    // boxed in: can't use the tow to accelerate
+        if (gap < lenAvg * BOXED_LEN && c.passT <= 0) towBoxed[i] = true;    // boxed in: can't use the tow to accelerate
         // close behind: ease back toward the following gap, but don't stand on the brakes for it
         if (gap < lenAvg * 1.5f) vT = fmn(vT, fmx(gap > 0.0f ? a.v * 0.9f : 0.0f, a.v + (gap - fg) * 2.2f));
         // and further back, brake in time for a much slower car (stopping distance)
@@ -927,6 +950,8 @@ static void updateCars(float dt, bool racing, bool coolDown) {
             }
           }
         }
+        // clear of them now: they can't come straight back at us on the same straight
+        if (sDelta(cars[c.passCar].s, c.s) > cs.len) cars[c.passCar].passCd = fmx(cars[c.passCar].passCd, REPASS_CD);
         c.passT -= dt;
         c.passAge += dt;
         // still gaining on them and not done yet: keep going
@@ -999,7 +1024,7 @@ static void updateCars(float dt, bool racing, bool coolDown) {
 
       // ── Longitudinal ──
       float accel = A_ACC * cs.acc * c.perf * (1.15f - 0.5f * c.v / (V_TOP * cs.top)) * wx * (c.surface == 1 ? 0.4f : (c.surface ? 0.6f : 1.0f));
-      accel *= 1.0f + TOW_ACC * c.tow * clampf(c.v / (V_TOP * cs.top), 0, 1);   // drag matters more the faster you go
+      accel *= (1.0f + TOW_ACC * (towBoxed[i] ? 0.0f : c.tow) * clampf(c.v / (V_TOP * cs.top), 0, 1)) * (c.passT > 0 && c.passCar >= 0 ? 1.0f + PASS_PUSH_ACC : 1.0f);   // drag matters more the faster you go
       // Faster than the straight-line target only because the tow has gone
       // (pulling out, or drawing alongside): lift and let drag slow the car,
       // keeping the momentum, instead of braking. Corners and traffic still brake.

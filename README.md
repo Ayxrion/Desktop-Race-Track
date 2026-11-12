@@ -27,9 +27,12 @@ It uses the same board setup and rendering approach as the koi pond (Desktop Aqu
   Close behind another car in a corner the dirty air costs grip. Drivers cover the inside into a corner when a car at least as quick is right on their tail, switch back underneath on the exit, and try round the outside, where the car on the inside has to leave room and loses a little exit speed.
   Side by side, a driver plans its speed for the path it's really on (beside the other car or along the kerb), and an attacker carries a little more than is comfortable.
   The classic AI (everyone on the one racing line) is still in the code: set `aiLines` to `false` in `cars.h`.
-- **Close racing**: within about a second of the car ahead, anywhere the track is flat out, a driver gets a strong tow that adds acceleration and top speed (never past what the next corner allows).
+- **Close racing**: within about a second of the car ahead and in line behind it, anywhere the track is flat out, a driver gets a strong tow that adds acceleration and top speed (never past what the next corner allows).
+  A car alongside gets no tow, so two cars side by side don't leapfrog each other down a straight.
+  Pulling out to pass, a driver keeps the tow's speed for a moment and gets a push to pass; the car they've just passed has to get back in the tow before attacking again.
   A driver committed to a move brakes later into the next corner, and once their nose is alongside on the inside, the other car usually gives way.
   A leader with a cushion manages the gap, and every driver's form drifts a little over a race, so gaps open and close.
+  Anyone can win from anywhere: there's no qualifying (the grid is random), and the further back a car is, the more speed it finds down the straights.
   A car with someone right behind is more likely to make a mistake.
 - **Driver traits**, shown as a coloured dot on the leaderboard and named in the tag of the car you're following.
   They change how someone races more than how fast they are, so any trait can win:
@@ -39,7 +42,7 @@ It uses the same board setup and rendering approach as the koi pond (Desktop Aqu
   - **Patient** (green): takes it a little easier, rarely attacks, keeps a bigger gap, and waves clearly faster cars through.
   - **Defensive** (orange): covers the inside when someone attacks, and won't give way when a car gets alongside.
   Every driver also lets cars that are lapping them through (blue flags).
-- **Race weekend loop**: cars form up on the grid behind the start lights, race for the set number of laps, and take the chequered flag.
+- **Race weekend loop**: cars form up on a random grid behind the start lights, race for the set number of laps, and take the chequered flag.
   The podium is shown, and then the next circuit is built.
   Races can also be endless.
 - **Timing**: positions, gaps to the leader (or laps down), last laps, the fastest lap, and a ticker for lead changes, passes for the podium, fastest laps and spins.
