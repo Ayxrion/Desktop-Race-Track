@@ -47,7 +47,7 @@ static void logRaceStart() {
   for (int k = 0; k < numCars; ++k) {
     const Car& c = cars[order[k]];
     gridSlot[order[k]] = k + 1; logPrevOrd[k] = order[k];
-    Serial.printf("RL GRID %d %s trait %d perf %.4f skill %.3f\n", k + 1, c.code, (int)c.trait, c.perf, c.skill);
+    Serial.printf("RL GRID %d %s perf %.4f skill %.3f\n", k + 1, c.code, c.perf, c.skill);
   }
   logLeadLap = 0; logPasses = logLeadChanges = logInc = 0;
 }
@@ -73,7 +73,7 @@ static void logRaceEnd() {
   for (int k = 0; k < numCars; ++k) {
     const Car& c = cars[order[k]];
     const int inc = c.incidents[EV_SPIN] + c.incidents[EV_WALL] + c.incidents[EV_GRAVEL] + c.incidents[EV_CONTACT];
-    Serial.printf("RL RES %d %s grid %d trait %d best %.3f inc %d laps %d\n", k + 1, c.code, gridSlot[order[k]], (int)c.trait, c.bestLap, inc, c.lap);
+    Serial.printf("RL RES %d %s grid %d best %.3f inc %d laps %d\n", k + 1, c.code, gridSlot[order[k]], c.bestLap, inc, c.finished ? c.finishLaps : c.lap);
   }
 }
 
@@ -118,7 +118,7 @@ static void updateRace(float dt) {
       Car& c = cars[order[k]];
       if (c.finished) continue;
       if (c.lap >= raceLaps || c.lap > c.lapsAtFlag) {
-        c.finished = true; c.finishPos = ++finishCount;
+        c.finished = true; c.finishPos = ++finishCount; c.finishLaps = c.lap;
         if (c.finishPos == 1) { char b[48]; snprintf(b, sizeof(b), "CHEQUERED FLAG - %s WINS!", c.code); raceEvent(b, 0, 5000); }
       }
     }

@@ -34,15 +34,12 @@ static const char* trackModeName(int m) {
 }
 static const char* seriesSelName(int s) { return s == 0 ? "Random" : SERIES_NAMES[clampi(s - 1, 0, SER_COUNT - 1)]; }
 
-// Default driver slots (before the user edits any): a spread of names and traits.
+// Default driver slots (before the user edits any).
 static void defaultCustomDrivers() {
-  static const uint8_t MIX[5] = { TR_BALANCED, TR_AGGRESSIVE, TR_CAUTIOUS, TR_DEFENSIVE, TR_PATIENT };
-  for (int i = 0; i < MAX_CARS; ++i) {
-    memcpy(customCode[i], DRIVER_CODES[i % NUM_CODES], 3); customCode[i][3] = 0;
-    customTrait[i] = MIX[(i * 3) % 5];
-  }
+  for (int i = 0; i < MAX_CARS; ++i) { memcpy(customCode[i], DRIVER_CODES[i % NUM_CODES], 3); customCode[i][3] = 0; }
 }
-struct DriverBlob { char code[MAX_CARS][4]; uint8_t trait[MAX_CARS]; };
+// unused: where each slot's driver trait was kept; still saved so saved names keep loading
+struct DriverBlob { char code[MAX_CARS][4]; uint8_t unused[MAX_CARS]; };
 
 static void loadSettings() {
   prefs.begin(SETTINGS_NS, true);
@@ -61,10 +58,7 @@ static void loadSettings() {
   {
     DriverBlob b;
     if (prefs.getBytesLength("drv") == sizeof(b) && prefs.getBytes("drv", &b, sizeof(b)) == sizeof(b)) {
-      for (int i = 0; i < MAX_CARS; ++i) {
-        memcpy(customCode[i], b.code[i], 4); customCode[i][3] = 0;
-        customTrait[i] = b.trait[i] < TR_COUNT ? b.trait[i] : (uint8_t)TR_BALANCED;
-      }
+      for (int i = 0; i < MAX_CARS; ++i) { memcpy(customCode[i], b.code[i], 4); customCode[i][3] = 0; }
     } else defaultCustomDrivers();
   }
   prefs.end();
@@ -90,7 +84,7 @@ static void saveSettings() {
   prefs.putBool("cdrv", customDrivers);
   {
     DriverBlob b;
-    memcpy(b.code, customCode, sizeof(b.code)); memcpy(b.trait, customTrait, sizeof(b.trait));
+    memcpy(b.code, customCode, sizeof(b.code)); memset(b.unused, 0, sizeof(b.unused));
     prefs.putBytes("drv", &b, sizeof(b));
   }
   prefs.end();

@@ -1,5 +1,5 @@
 #pragma once
-// Race cars: classes, driver traits, liveries, driving physics/AI and drawing.
+// Race cars: classes, liveries, driving physics/AI and drawing.
 //
 // Each car has a real position, heading and speed, and steers like a car: a
 // path-tracking controller follows the line the driver wants (the racing line,
@@ -10,10 +10,9 @@
 // grass, in the gravel, in the wall, or spinning. Mistakes come out of that
 // physics rather than being scripted.
 //
-// Driver traits change how hard drivers push (how much grip they *think* they
-// have, how late they brake, how they adapt to the wet) and their racecraft
-// (when they attack, how much room they need, how close they follow, whether
-// they defend or wave faster cars through).
+// Every driver races the same way; they differ in skill (mistakes, how
+// consistently they commit to corners), a little raw pace, their form on the
+// day and their own lines (apex timing, kerb use, how wide they turn in).
 
 #include "effects.h"
 
@@ -37,10 +36,10 @@ static const ClassSpec CLS[CC_COUNT] = {
 enum Series : uint8_t { SER_FORMULA, SER_GT, SER_TOURING, SER_ENDURANCE, SER_CLASSIC, SER_VANS, SER_COUNT };
 static const char* const SERIES_NAMES[SER_COUNT] = { "Formula", "GT", "Touring", "Endurance", "Classic", "Vans" };
 
-// ─── Driver traits ────────────────────────────────────────────────────────────
-enum Trait : uint8_t { TR_AGGRESSIVE, TR_BALANCED, TR_CAUTIOUS, TR_PATIENT, TR_DEFENSIVE, TR_COUNT };
-struct TraitSpec {
-  const char* name; uint32_t col;
+// ─── Racecraft ────────────────────────────────────────────────────────────────
+// The same for every driver. (There used to be driver traits; they decided too
+// many races, so every driver now races as the old "Balanced" one did.)
+struct DriverSpec {
   float corner;       // cornering speed vs the grip the car really has (sqrt-scaled; >1.1 slides)
   float straight;     // top-speed commitment
   float brake;        // braking decel they plan for (higher = brakes later)
@@ -53,19 +52,9 @@ struct TraitSpec {
   float followGap;    // following distance, in car lengths
   float mistake;      // lapse multiplier
   float spin;         // spin-when-sliding multiplier
-  bool  cornerAttack; // will attack on corner entry, not only on straights
-  bool  yields;       // moves aside for a faster car behind
-  bool  blocks;       // covers the inside when attacked
 };
-static const TraitSpec TRAITS[TR_COUNT] = {
-  //  name          col        corner straight brake wet   sigma  aware margin gap  room  follow mist spin  attack yield block
-  { "Aggressive", 0xFF5040u, 1.006f, 1.003f, 1.015f, 0.82f, 0.032f, 0.50f,  1.5f, 3.6f, -0.5f, 0.28f, 1.4f, 1.5f, true,  false, false },
-  { "Balanced",   0xE8E8E8u, 1.000f, 1.000f, 1.00f, 0.92f, 0.025f, 0.75f,  3.0f, 3.0f,  0.0f, 0.45f, 1.0f, 1.0f, false, false, false },
-  { "Cautious",   0x60A8FFu, 0.995f, 0.999f, 0.985f, 1.00f, 0.018f, 0.90f,  4.0f, 2.8f,  0.4f, 0.55f, 0.7f, 0.7f, false, false, false },
-  { "Patient",    0x60D080u, 0.990f, 0.998f, 0.975f, 1.02f, 0.014f, 0.95f,  5.0f, 2.6f,  0.6f, 0.65f, 0.5f, 0.5f, false, true,  false },
-  { "Defensive",  0xFFB040u, 0.999f, 1.000f, 1.005f, 0.92f, 0.022f, 0.75f,  3.0f, 3.0f,  0.0f, 0.42f, 0.9f, 1.0f, false, false, true  },
-};
-static const uint8_t TRAIT_WEIGHTS[TR_COUNT] = { 25, 30, 20, 10, 15 };
+//                         corner straight brake wet   sigma  aware margin gap  room  follow mist spin
+static const DriverSpec DRV = { 1.000f, 1.000f, 1.00f, 0.92f, 0.025f, 0.75f,  3.0f, 3.0f,  0.0f, 0.45f, 1.0f, 1.0f };
 
 enum CarState : uint8_t { CS_RACE, CS_SPIN, CS_STOPPED, CS_RECOVER };
 
@@ -91,7 +80,7 @@ struct Car {
   float passT; int8_t passSide; int8_t passCar; int8_t outMove;   // outMove: a deliberate move round the outside of a corner
   float passCd;             // > 0: just backed out of a move; wait before trying again
   float passAge;            // how long the current move has been going
-  float vTop;               // its straight-line top speed (form, trait, class), without any tow
+  float vTop;               // its straight-line top speed (form, class), without any tow
   // Driving style for their own lines (each about -1..1): apex timing (+ = late),
   // kerb use at the apex, how wide they turn in and track out, and lap-to-lap variation.
   float stApex, stKerb, stIn, stOut, stVar;
@@ -101,16 +90,16 @@ struct Car {
   int8_t cutback;           // corner to take with a late apex to cut back after being passed (-1 none)
   float overT;              // > 0: just overdid it (understeer or oversteer), for the viewer/stats
   float exitPush;           // how hard they'll lean on the throttle out of the coming corner (0 = within traction)
-  float blockT, blockCd, yieldT; int8_t yieldSide;
+  float blockCd, yieldT; int8_t yieldSide;
   float lockT, contactCd, recoverT;
   float stopT;
   float lapStart, lastLap, bestLap;
   int   lap;                // completed laps (−1 before first crossing)
   int   lapsAtFlag;
-  bool  finished; int finishPos;
+  bool  finished; int finishPos, finishLaps;   // finishPos: order of crossing the line after the flag
   bool  braking;
   CarState state;
-  uint8_t cls, trait;
+  uint8_t cls;
   uint8_t num;
   uint32_t c1, c2, c3;      // livery
   char  code[4];
@@ -143,11 +132,10 @@ static const char* const DRIVER_CODES[] = {
   "MIR", "NOV", "OST", "RAD", "SOL", "TOR", "VAN", "WIL", "ACH", "BAK" };
 #define NUM_CODES ((int)(sizeof(DRIVER_CODES) / sizeof(DRIVER_CODES[0])))
 
-// Custom drivers (Settings → Drivers). When on, car i gets slot i's name and
-// trait instead of random ones. Saved in NVS by settings.h.
+// Custom drivers (Settings → Drivers). When on, car i gets slot i's name
+// instead of a random one. Saved in NVS by settings.h.
 static bool    customDrivers = false;
 static char    customCode[MAX_CARS][4];
-static uint8_t customTrait[MAX_CARS];
 
 static const uint32_t TEAM_COLS[][3] = {
   { 0xD8202Au, 0xF0F0F0u, 0xF0D020u }, { 0x1E3A8Au, 0xF0C020u, 0xE02020u }, { 0x0A7A5Au, 0xE8E8E8u, 0x40E0B0u },
@@ -353,13 +341,6 @@ static inline void IRAM_ATTR lineCurEval(const LineCur& lc, float u, const Track
 }
 static inline float lineCurD(const LineCur& lc, float u, const TrackPt& P) { float d, k; lineCurEval(lc, u, P, d, k); return d; }
 
-static uint8_t pickTrait() {
-  int total = 0; for (int t = 0; t < TR_COUNT; ++t) total += TRAIT_WEIGHTS[t];
-  int r = irandr(0, total);
-  for (int t = 0; t < TR_COUNT; ++t) { if (r < TRAIT_WEIGHTS[t]) return (uint8_t)t; r -= TRAIT_WEIGHTS[t]; }
-  return TR_BALANCED;
-}
-
 static void setupCars(int n, uint8_t series, uint32_t seed) {
   uint32_t save = _rng;
   _rng = seed * 2246822519u + 77u; if (!_rng) _rng = 1;
@@ -395,33 +376,18 @@ static void setupCars(int n, uint8_t series, uint32_t seed) {
     }
     memcpy(c.code, DRIVER_CODES[codes[i % NUM_CODES]], 3); c.code[3] = 0;
     c.num = (uint8_t)irandr(1, 99);
-    c.trait = pickTrait();
-    if (customDrivers) {      // the user's own field (the random draws above still happen, so nothing else changes)
-      if (customCode[i][0]) { memcpy(c.code, customCode[i], 4); c.code[3] = 0; }
-      c.trait = customTrait[i] < TR_COUNT ? customTrait[i] : (uint8_t)TR_BALANCED;
-    }
-    {
-      // Driving style: a base from the trait plus their own quirks.
-      float a = 0, k = 0, in = 0, out = 0, var = 0.6f;
-      switch (c.trait) {
-        case TR_AGGRESSIVE: a = -0.2f; k = 0.4f; in = 0.2f; out = 0.3f; var = 1.0f; break;
-        case TR_CAUTIOUS:   a = 0.5f; k = -0.3f; in = -0.1f; out = -0.2f; var = 0.45f; break;
-        case TR_PATIENT:    a = 0.6f; k = -0.6f; in = -0.3f; out = -0.4f; var = 0.35f; break;
-        case TR_DEFENSIVE:  a = 0.2f; k = 0.2f; break;
-        default: break;
-      }
-      c.stApex = clampf(a + frandr(-0.4f, 0.4f), -1, 1);
-      c.stKerb = clampf(k + frandr(-0.7f, 0.4f), -1, 1);
-      c.stIn   = clampf(in + frandr(-0.4f, 0.4f), -1, 1);
-      c.stOut  = clampf(out + frandr(-0.4f, 0.4f), -1, 1);
-      c.stVar  = clampf(var + frandr(-0.2f, 0.2f), 0.2f, 1.2f);
-    }
+    if (customDrivers && customCode[i][0]) { memcpy(c.code, customCode[i], 4); c.code[3] = 0; }   // the user's own field
+    // Driving style: their own quirks.
+    c.stApex = clampf(frandr(-0.4f, 0.4f), -1, 1);
+    c.stKerb = clampf(frandr(-0.7f, 0.4f), -1, 1);
+    c.stIn   = clampf(frandr(-0.4f, 0.4f), -1, 1);
+    c.stOut  = clampf(frandr(-0.4f, 0.4f), -1, 1);
+    c.stVar  = clampf(0.6f + frandr(-0.2f, 0.2f), 0.2f, 1.2f);
     c.cutback = -1;
     c.perf = frandr(0.988f, 1.0f);
     c.skill = frandr(0.86f, 0.99f);
-    c.react = frandr(0.05f, 0.45f) * (c.trait == TR_AGGRESSIVE ? 0.7f : (c.trait == TR_PATIENT ? 1.3f : 1.0f));
+    c.react = frandr(0.05f, 0.45f);
     c.commit = 1.0f;
-    const TraitSpec& T = TRAITS[c.trait];
     quali[i] = frandr(-0.015f, 0.015f);   // no qualifying: a random grid, so pole is no head start for the quickest
   }
   int gridOrd[MAX_CARS];
@@ -453,8 +419,7 @@ static void setupCars(int n, uint8_t series, uint32_t seed) {
 }
 
 // ─── Racing: pace variation, tow, passing ─────────────────────────────────────
-// Traits change behaviour more than raw pace; what makes the racing close is
-// below. Tuned with the PC harness over 180 races (16 cars, 10 laps): about 36
+// What makes the racing close is below. Tuned with the PC harness over 180 races (16 cars, 10 laps): about 36
 // clean on-track overtakes a race, ~13 of them for the lead, ~3.6 incidents.
 #define FORM_TAU       25.0f    // s: how quickly a driver's form drifts
 #define FORM_SD        0.010f   // typical form offset (×): gaps open and close
@@ -498,8 +463,10 @@ static void setupCars(int n, uint8_t series, uint32_t seed) {
 #define SETUP_T        0.8f    // s behind someone at the corner decision: close enough for a setup line
 #define DIRTY_T        0.5f     // s behind another car in a corner where dirty air starts to bite
 #define DIRTY_GRIP     0.08f    // grip lost right on their tail in a corner
-#define GREED_BAL      0.08f    // how far past the tyre's limit a balanced driver pushes the pedals
-#define GREED_AGG      0.15f    // ...and an aggressive one
+#define GREED          0.08f    // how far past the tyre's limit a driver pushes the pedals
+#define OUTSIDE_RATE   0.55f    // per second, right behind someone in a corner: how readily a driver tries round the outside
+#define SETUP_RATE     0.35f    // per corner, following closely: how often a driver takes a wide entry / late apex to set up the exit
+#define COVER_RATE     0.45f    // per second, with someone on their tail: how readily a driver covers the inside
 #define CUTBACK_P      0.6f     // chance a driver who gives the corner tries a switchback
 #define CORNER_SLOW    0.65f    // a corner (for racecraft) is where the car must slow below this share of top speed
 #define FLAT_OUT       0.97f    // ...and flat out (for the tow) is anywhere it can carry this share
@@ -512,10 +479,8 @@ static void setupCars(int n, uint8_t series, uint32_t seed) {
 #define PASS_PULL      4.0f     // px/s: minimum rate of pulling out to pass (lane changes ease in otherwise)
 #define PASS_MAX_T     6.0f     // s: longest a move is kept going while still gaining
 #define RACE_ROOM      1.6f     // px of gap left to a car alongside...
-#define RACE_ROOM_TIGHT 0.8f    // ...or less by aggressive and defensive drivers
 #define OVERLAP_NEED   0.5f     // car lengths of overlap needed on the inside before the other car gives way
 #define CONCEDE        0.96f    // a car giving the corner lifts this much (×)
-#define YIELD_DV       6.0f     // px/s: how much quicker a car must be before a patient driver waves it by
 
 // ─── Physics helpers ──────────────────────────────────────────────────────────
 static inline float gripFactor() { return 1.0f - 0.14f * wetAmt - 0.14f * snowCover; }
@@ -558,29 +523,12 @@ static void projectCar(Car& c) {
   c.d = bd;
 }
 
-// How far past what the tyre can give a driver pushes the pedals (0 = never).
-static inline float greedOf(uint8_t t) {
-  switch (t) { case TR_AGGRESSIVE: return GREED_AGG; case TR_CAUTIOUS: return 0.02f; case TR_PATIENT: return 0.0f; case TR_DEFENSIVE: return 0.06f; default: return GREED_BAL; }
-}
-// How readily a driver tries round the outside in a corner (per second, right behind someone).
-static inline float outsideRateOf(uint8_t t) {
-  switch (t) { case TR_AGGRESSIVE: return 1.2f; case TR_CAUTIOUS: return 0.15f; case TR_PATIENT: return 0.0f; case TR_DEFENSIVE: return 0.4f; default: return 0.55f; }
-}
-// How often a driver following closely takes a wide entry / late apex to set up the exit (per corner).
-static inline float setupRateOf(uint8_t t) {
-  switch (t) { case TR_AGGRESSIVE: return 0.5f; case TR_CAUTIOUS: return 0.15f; case TR_PATIENT: return 0.1f; case TR_DEFENSIVE: return 0.3f; default: return 0.35f; }
-}
-// How readily a driver covers the inside with someone on their tail (per second).
-static inline float coverRateOf(uint8_t t) {
-  switch (t) { case TR_AGGRESSIVE: return 0.6f; case TR_CAUTIOUS: return 0.25f; case TR_PATIENT: return 0.0f; case TR_DEFENSIVE: return 1.6f; default: return 0.45f; }
-}
-
 // Approaching a corner: decide how hard to commit, and maybe make a mistake.
 static void cornerEntry(Car& c) {
-  const TraitSpec& T = TRAITS[c.trait];
+  const DriverSpec& T = DRV;
   float g = (frand() + frand() + frand() - 1.5f) * 2.0f;            // ~N(0,1)
   c.commit = 1.0f + g * T.sigma * (1.6f - c.skill);
-  c.exitPush = greedOf(c.trait) * frand() * 2.0f * (1.4f - c.skill);
+  c.exitPush = GREED * frand() * 2.0f * (1.4f - c.skill);
   float p = (1.0f - c.skill) * 0.09f * T.mistake * (1.0f + 2.5f * wetAmt + 3.0f * snowCover) * (c.pressT > 0 ? PRESSURE_MIST : 1.0f);
   if (frand() < p) { c.commit += frandr(0.08f, 0.24f); c.lockT = 0.35f; }  // a lapse: brakes far too late
 }
@@ -606,7 +554,7 @@ static void updateCars(float dt, bool racing, bool coolDown) {
   for (int i = 0; i < numCars; ++i) {
     Car& c = cars[i];
     const ClassSpec& cs = CLS[c.cls];
-    const TraitSpec& T = TRAITS[c.trait];
+    const DriverSpec& T = DRV;
     TrackFrame f; trackAt(c.s, f);
     const float fi0 = wrapS(c.s) * simInvDs;      // this car's place in the track samples
     const float trackAng = atan2f(f.ty, f.tx);
@@ -651,7 +599,7 @@ static void updateCars(float dt, bool racing, bool coolDown) {
       const float wxBelief = wx == 1.0f ? 1.0f : powf(wx, T.wetAdapt);   // (dry: skip the slow powf)
       const float gT = gCar * wxBelief * T.corner * c.commit;
       const float abPlain = A_BRK * T.brake * sqrtf(gCar) * wxBelief;                          // comfortable braking
-      const float ab = abPlain * (c.passT > 0 ? DIVE_BRAKE : 1.0f) * (aiLines ? 1.0f + 0.3f * greedOf(c.trait) : 1.0f);
+      const float ab = abPlain * (c.passT > 0 ? DIVE_BRAKE : 1.0f) * (aiLines ? 1.0f + 0.3f * GREED : 1.0f);
       if (racing) {                                // drift the driver's form
         float g = (frand() + frand() + frand() - 1.5f) * 2.0f;
         c.form += -c.form * (dt / FORM_TAU) + formK * g;
@@ -851,19 +799,18 @@ static void updateCars(float dt, bool racing, bool coolDown) {
         bool lapping = c.dist - a.dist > trk.L * 0.5f;
         // only a real speed edge counts: not just that they're already braking for a corner
         const bool aAtSpeed = !a.braking && !slowAt(a.s);
-        const bool dive = T.cornerAttack && gap < lenAvg * 1.2f;
         // A real speed edge: closing on them now, or able to go faster than them
         // down this straight with the tow. (Not just that they're still
         // accelerating out of the corner while our target is already higher.)
         const float edge = fmx(c.v - a.v, vTopCap * (1.0f + TOW_GAIN * c.tow) - a.vTop);
-        bool faster = (edge > T.passMargin && (aAtSpeed || dive)) || a.state != CS_RACE || (lapping && vFree > a.v);
-        bool allowed = T.cornerAttack || !cornerNear || a.state != CS_RACE || lapping;
+        bool faster = (edge > T.passMargin && aAtSpeed) || a.state != CS_RACE || (lapping && vFree > a.v);
+        bool allowed = !cornerNear || a.state != CS_RACE || lapping;
         const float passWin = fmx(T.passGap * lenAvg, c.v * PASS_T * (T.passGap / 3.0f));
         const bool obstacle = a.state != CS_RACE || a.v < OBSTACLE_V;   // crawling or stricken: just go round
         // Round the outside: right behind them in a corner, carrying as much speed,
         // a driver may swing wide and try to go round (more so if they cover the inside).
         const bool cornerMove = aiLines && cornerNear && !lapping && !obstacle && gap < lenAvg * OUTSIDE_GAP && c.v > a.v - 3.0f &&
-                                frand() < outsideRateOf(c.trait) * (a.coverT > 0 ? 2.0f : 1.0f) * OUTSIDE_RATE_K * dt;
+                                frand() < OUTSIDE_RATE * (a.coverT > 0 ? 2.0f : 1.0f) * OUTSIDE_RATE_K * dt;
         if (c.passT <= 0 && c.passCd <= 0 && ((faster && allowed) || cornerMove) && gap < passWin && racing && !coolDown) {
           const float hwP = hwC + PASS_EDGE;       // stays on the track proper
           // room either side of them, now and where their line takes them next
@@ -880,17 +827,17 @@ static void updateCars(float dt, bool racing, bool coolDown) {
             if (kN == 0) kN = tpU(fi0, 50.0f).rk;
             int inside = kN > 0 ? 1 : -1;
             float roomIn = inside > 0 ? roomR : roomL, roomOut = inside > 0 ? roomL : roomR;
-            c.passSide = (roomIn > 0 && (roomIn >= roomOut - 2.0f || T.cornerAttack || uN < PASS_INSIDE_U)) ? inside : -inside;
+            c.passSide = (roomIn > 0 && (roomIn >= roomOut - 2.0f || uN < PASS_INSIDE_U)) ? inside : -inside;
             const bool insideShut = roomIn <= 0 || a.coverT > 0;
             c.outMove = 0;
             if (cornerMove && !(faster && allowed)) { c.passSide = roomOut > 0 ? -inside : 0; c.outMove = 1; }   // chose the outside
-            else if (aiLines && insideShut && roomOut > 0 && outsideRateOf(c.trait) > 0 && uN < PASS_INSIDE_U && gap < lenAvg * OUTSIDE_GAP * 1.5f) { c.passSide = -inside; c.outMove = 1; }
+            else if (aiLines && insideShut && roomOut > 0 && uN < PASS_INSIDE_U && gap < lenAvg * OUTSIDE_GAP * 1.5f) { c.passSide = -inside; c.outMove = 1; }
             // round the outside into a corner that's close, without meaning it: not a real move, so wait
             else if (c.passSide != inside && uN < PASS_INSIDE_U && !lapping && !obstacle) c.passSide = 0;
           }
           if (c.passSide != 0 && (roomR > 0 || roomL > 0)) {
             c.passT = 2.5f; c.passAge = 0; c.passCar = (int8_t)ahead;
-            if (cornerNear) c.commit = fmx(c.commit, T.cornerAttack ? 1.03f : ATTACK_COMMIT);   // late on the brakes
+            if (cornerNear) c.commit = fmx(c.commit, ATTACK_COMMIT);   // late on the brakes
           }
         }
         float fg = T.followGap * lenAvg;
@@ -921,7 +868,7 @@ static void updateCars(float dt, bool racing, bool coolDown) {
           const float lenAvgP = (cs.len + CLS[a.cls].len) * 0.5f;
           // ...unless we are carrying enough extra speed to be ahead before turning in
           const float aheadAtTurnIn = sDelta(a.s, c.s) + (c.v - a.v) * (uC / fmx(c.v, 20.0f));
-          const bool holdOutside = aiLines && outsideRateOf(c.trait) > 0 &&
+          const bool holdOutside = aiLines &&
                                    (sDelta(a.s, c.s) > -lenAvgP * 0.6f || c.v > a.v + 4.0f);   // alongside or quicker: keep going round the outside
           if (c.outMove && (sDelta(a.s, c.s) < -lenAvgP * OUTSIDE_DROP || (c.passAge > 0.8f && sDelta(a.s, c.s) < -lenAvgP * 1.4f && c.v < a.v - 1.0f))) {
             c.passT = 0; c.passCd = PASS_RETRY; c.outMove = 0;           // dropped back: tuck in behind again
@@ -940,7 +887,7 @@ static void updateCars(float dt, bool racing, bool coolDown) {
           nextCorner(0.0f, 60.0f, kN);
           bool inside = (kN > 0 && c.passSide > 0) || (kN < 0 && c.passSide < 0);
           float overlap = sDelta(a.s, c.s);           // > 0: we're ahead of them
-          if (inside && overlap > -(cs.len * OVERLAP_NEED) && !TRAITS[a.trait].cornerAttack && !TRAITS[a.trait].blocks)
+          if (inside && overlap > -(cs.len * OVERLAP_NEED))
           {
             Car& dfd = cars[c.passCar];
             dfd.concedeT = 0.5f;
@@ -971,11 +918,7 @@ static void updateCars(float dt, bool racing, bool coolDown) {
           if (o.d < c.d) dT = fmx(dT, fmn(o.d + keep, hwC)); else dT = fmn(dT, fmx(o.d - keep, -hwC));
         }
         bool lapped = o.dist - c.dist > trk.L * 0.5f;
-        if ((T.yields && o.v > c.v + YIELD_DV) || lapped) {
-          if (c.yieldT <= 0) { c.yieldT = 2.0f; c.yieldSide = (int8_t)(o.passSide > 0 ? -1 : 1); }
-        } else if (T.blocks && c.blockCd <= 0 && !cornerNear && attackGap < 2.0f * cs.len) {
-          c.blockT = 1.0f; c.blockCd = 5.0f;
-        }
+        if (lapped && c.yieldT <= 0) { c.yieldT = 2.0f; c.yieldSide = (int8_t)(o.passSide > 0 ? -1 : 1); }
       }
       const bool threat = behind >= 0 && behindGap - (cs.len + CLS[cars[behind].cls].len) * 0.5f < cars[behind].v * COVER_T && cars[behind].v > c.v - 3.0f;
       if (aiLines && racing && !coolDown && c.state == CS_RACE && threat && c.coverT <= 0 && c.blockCd <= 0) {
@@ -983,12 +926,10 @@ static void updateCars(float dt, bool racing, bool coolDown) {
         // inside up to the turn-in. (Covering for anyone close, and holding it through the exit,
         // left a whole queue on slow inside lines while the leaders got away in long races.)
         float kq = 0; const float uq = nextCorner(40.0f, 160.0f, kq);
-        if (uq < 1e8f && kq != 0 && frand() < coverRateOf(c.trait) * dt) { c.coverT = fmn(1.6f, uq / fmx(c.v, 30.0f) + 0.15f); c.blockCd = COVER_CD; c.coverSide = kq > 0 ? 1 : -1; }
+        if (uq < 1e8f && kq != 0 && frand() < COVER_RATE * dt) { c.coverT = fmn(1.6f, uq / fmx(c.v, 30.0f) + 0.15f); c.blockCd = COVER_CD; c.coverSide = kq > 0 ? 1 : -1; }
       }
       if (c.coverT > 0) { c.coverT -= dt; dT = c.coverSide * (hwC - 1.5f); }
       if (c.yieldT > 0) { c.yieldT -= dt; dT = c.yieldSide * hwC * 0.75f; vT = fmn(vT, vFree * 0.97f); }
-      if (c.blockT > 0 && attacker >= 0) { c.blockT -= dt; dT = clampf(cars[attacker].dPath, -hwC, hwC); }
-      else if (c.blockT > 0) c.blockT -= dt;
       if (c.blockCd > 0) c.blockCd -= dt;
       if (c.passCd > 0) c.passCd -= dt;
 
@@ -1003,7 +944,7 @@ static void updateCars(float dt, bool racing, bool coolDown) {
           float lenAvg = (cs.len + CLS[o.cls].len) * 0.5f, widAvg = (cs.wid + CLS[o.cls].wid) * 0.5f;
           float g = sDelta(c.s, o.s);
           if (fabsf(g) > lenAvg * 1.1f || fabsf(o.d - c.d) > widAvg + 4.0f) continue;
-          const float room = widAvg + ((T.cornerAttack || T.blocks) ? RACE_ROOM_TIGHT : RACE_ROOM);
+          const float room = widAvg + RACE_ROOM;
           if (o.d >= c.d) { dT = fmn(dT, o.d - room); if (dT < -edgeR && g > 0) { if (c.passT > 0) c.passCd = PASS_RETRY; c.passT = 0; vT = fmn(vT, fmx(o.v - 3.0f, 10.0f)); } }
           else            { dT = fmx(dT, o.d + room); if (dT >  edgeR && g > 0) { if (c.passT > 0) c.passCd = PASS_RETRY; c.passT = 0; vT = fmn(vT, fmx(o.v - 3.0f, 10.0f)); } }
           dT = clampf(dT, -edgeR, edgeR);
@@ -1084,7 +1025,7 @@ static void updateCars(float dt, bool racing, bool coolDown) {
       // have; only arriving too fast for the corner itself (the line's own
       // curvature, kff) overwhelms the tyres, and then the car slides wide.
       const float kMax = aLatMax * latShare / fmx(c.v * c.v, 1.0f);
-      const float cap = kMax * (T.cornerAttack ? 1.04f : 0.97f);
+      const float cap = kMax * 0.97f;
       kc = clampf(kc, -cap, cap);
       const float demand = fabsf(kff) / kMax;
       // for spins: what the corner itself asks of the tyre (a front slide from braking runs wide, it doesn't spin)
@@ -1205,8 +1146,7 @@ static void updateCars(float dt, bool racing, bool coolDown) {
       if (hard) {
         rear.contactCd = front.contactCd = 4.0f;
         rear.v *= 0.85f; front.v *= 0.95f;
-        bool rough = rear.trait == TR_AGGRESSIVE || front.trait == TR_DEFENSIVE;
-        if (frand() < (rough ? 0.22f : 0.08f)) {
+        if (frand() < 0.08f) {
 #ifdef RT_DEBUG_SPIN
           printf("  spin-contact %s by %s s=%.0f\n", front.code, rear.code, front.s);
 #endif
@@ -1249,7 +1189,7 @@ static void updateCars(float dt, bool racing, bool coolDown) {
       float toC = sDelta(c.s, C.i0 * trk.ds);
       if (toC < 170.0f) {                                  // decide before the braking zone starts
         if (toC > -50.0f && racing && c.state == CS_RACE) cornerEntry(c);
-        if (aiLines && racing && c.state == CS_RACE && c.passT <= 0 && c.cutback < 0 && frand() < setupRateOf(c.trait)) {
+        if (aiLines && racing && c.state == CS_RACE && c.passT <= 0 && c.cutback < 0 && frand() < SETUP_RATE) {
           // right behind someone into this corner: wide entry, late apex, for a better exit and the tow
           for (int j = 0; j < numCars; ++j) {
             if (j == i) continue;
@@ -1283,13 +1223,17 @@ static void updateCars(float dt, bool racing, bool coolDown) {
   }
 }
 
-// Sort by position: finishers in finishing order, then by distance covered.
+// Sort by position: by distance covered while racing. Finishers rank by laps
+// completed, then by when they crossed the line, so a car a lap down that takes
+// the flag just behind the winner still ranks behind every car on the lead lap
+// (a car still running will finish with lapsAtFlag + 1 laps).
 static void updateOrder() {
   for (int i = 0; i < numCars; ++i) order[i] = i;
   std::sort(order, order + numCars, [](int a, int b) {
     const Car& A = cars[a]; const Car& B = cars[b];
-    if (A.finished != B.finished) return A.finished;
-    if (A.finished) return A.finishPos < B.finishPos;
+    if (A.finished && B.finished) return A.finishLaps != B.finishLaps ? A.finishLaps > B.finishLaps : A.finishPos < B.finishPos;
+    if (A.finished) return A.finishLaps >= B.lapsAtFlag + 1;
+    if (B.finished) return B.finishLaps < A.lapsAtFlag + 1;
     return A.dist > B.dist;
   });
   for (int k = 0; k < numCars; ++k) cars[order[k]].pos = k + 1;

@@ -34,14 +34,8 @@ It uses the same board setup and rendering approach as the koi pond (Desktop Aqu
   A leader with a cushion manages the gap, and every driver's form drifts a little over a race, so gaps open and close.
   Anyone can win from anywhere: there's no qualifying (the grid is random), and the further back a car is, the more speed it finds down the straights.
   A car with someone right behind is more likely to make a mistake.
-- **Driver traits**, shown as a coloured dot on the leaderboard and named in the tag of the car you're following.
-  They change how someone races more than how fast they are, so any trait can win:
-  - **Aggressive** (red): a touch more speed into corners and later braking, dives up the inside even mid-corner, and needs the least room. They make the most mistakes and visit the gravel most.
-  - **Balanced** (no dot): the baseline.
-  - **Cautious** (blue): slightly off the limit with clean lines, and needs a clearer advantage before passing.
-  - **Patient** (green): takes it a little easier, rarely attacks, keeps a bigger gap, and waves clearly faster cars through.
-  - **Defensive** (orange): covers the inside when someone attacks, and won't give way when a car gets alongside.
-  Every driver also lets cars that are lapping them through (blue flags).
+- **Drivers** all race the same way, so no kind of driver has an edge. They differ in skill (how often they make mistakes), a little raw pace, their form on the day, and their own lines through corners.
+  Every driver lets cars that are lapping them through (blue flags).
 - **Race weekend loop**: cars form up on a random grid behind the start lights, race for the set number of laps, and take the chequered flag.
   The podium is shown, and then the next circuit is built.
   Races can also be endless.
@@ -79,8 +73,8 @@ Pressing buttons or changing settings doesn't stop the TV camera either way.
 Settings are saved to flash (NVS). Car count, track, car type and drivers take effect at the next race. Race length applies right away.
 
 **Drivers** (in settings) lists 20 driver slots.
-Turn *Custom* on and car 1 gets slot 1's name and trait, car 2 slot 2's, and so on; turn it off for random drivers each race.
-Tap a name to type a new one (up to 3 letters or digits), tap a trait to cycle through Balanced, Cautious, Patient, Defensive and Aggressive, and *Copy this race* fills the slots from the field that's racing now.
+Turn *Custom* on and car 1 gets slot 1's name, car 2 slot 2's, and so on; turn it off for random drivers each race.
+Tap a name to type a new one (up to 3 letters or digits), and *Copy this race* fills the slots from the field that's racing now.
 Slots past the number of cars sit out.
 
 ## Building (Arduino IDE)

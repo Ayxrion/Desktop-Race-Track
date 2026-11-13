@@ -63,13 +63,12 @@ static const int8_t ROW_ID[PANEL_ROWS + 1] = { UI_NONE, UI_P_WX_PREV, UI_P_TIME_
 static int  panelPage = 0;
 static int  editSlot = 0;
 static char editBuf[4] = "";
-enum : int { UI_D_TOGGLE = 100, UI_D_COPY, UI_D_BACK, UI_D_NAME0 = 110, UI_D_TRAIT0 = 140,
+enum : int { UI_D_TOGGLE = 100, UI_D_COPY, UI_D_BACK, UI_D_NAME0 = 110,
              UI_K_KEY0 = 200, UI_K_DEL = 250, UI_K_CANCEL, UI_K_OK };
 static const char KEYS[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 #define NUM_KEYS 36
 static const Rect D_TOGGLE = { PANEL_X + PANEL_W - 190, PANEL_Y + 10, 166, 34 };
 static Rect dSlotName(int k)  { int col = k / 10, row = k % 10; return { (int16_t)(PANEL_X + 16 + col * 240 + 26), (int16_t)(PANEL_Y + 78 + row * 31), 62, 27 }; }
-static Rect dSlotTrait(int k) { int col = k / 10, row = k % 10; return { (int16_t)(PANEL_X + 16 + col * 240 + 94), (int16_t)(PANEL_Y + 78 + row * 31), 132, 27 }; }
 static Rect kKey(int i)       { int col = i % 9, row = i / 9; return { (int16_t)(PANEL_X + 27 + col * 50), (int16_t)(PANEL_Y + 112 + row * 48), 46, 42 }; }
 static const Rect K_DEL = { PANEL_X + 24, PANEL_Y + 320, 130, 40 };
 static const Rect PANEL       = { PANEL_X, PANEL_Y, PANEL_W, PANEL_H };
@@ -89,7 +88,6 @@ static int hitPanel(int x, int y) {
     if (D_TOGGLE.hit(x, y)) return UI_D_TOGGLE;
     for (int k = 0; k < MAX_CARS; ++k) {
       if (dSlotName(k).hit(x, y)) return UI_D_NAME0 + k;
-      if (dSlotTrait(k).hit(x, y)) return UI_D_TRAIT0 + k;
     }
     if (P_NEXT_RACE.hit(x, y)) return UI_D_COPY;
     if (P_CLOSE.hit(x, y)) return UI_D_BACK;
@@ -187,13 +185,10 @@ static void driversAction(int id) {
     customDrivers = !customDrivers;
     toast(customDrivers ? "Custom drivers: from the next race" : "Random drivers: from the next race", 2200);
   } else if (id == UI_D_COPY) {                       // start from the field that's racing now
-    for (int i = 0; i < numCars && i < MAX_CARS; ++i) { memcpy(customCode[i], cars[i].code, 4); customCode[i][3] = 0; customTrait[i] = cars[i].trait; }
+    for (int i = 0; i < numCars && i < MAX_CARS; ++i) { memcpy(customCode[i], cars[i].code, 4); customCode[i][3] = 0; }
     toast("Copied this race's drivers", 1800);
   } else if (id == UI_D_BACK) {
     panelPage = 0; saveSettings();
-  } else if (id >= UI_D_TRAIT0 && id < UI_D_TRAIT0 + MAX_CARS) {
-    uint8_t& t = customTrait[id - UI_D_TRAIT0];
-    t = (uint8_t)((t + 1) % TR_COUNT);
   } else if (id >= UI_D_NAME0 && id < UI_D_NAME0 + MAX_CARS) {
     editSlot = id - UI_D_NAME0;
     memcpy(editBuf, customCode[editSlot], 4); editBuf[3] = 0;
@@ -279,7 +274,7 @@ static void onTap(int x, int y) {
   if (c >= 0) {
     followCar = c; autoCam = false;
     if (cam.zoom < 1.2f) { cam.targetZoom = 1.6f; cam.animZoom = true; cam.anchorSX = SCREEN_CX; cam.anchorSY = SCREEN_CY; }
-    char b[48]; snprintf(b, sizeof(b), "Following P%d %s  (%s, %s)", cars[c].pos, cars[c].code, CLS[cars[c].cls].name, TRAITS[cars[c].trait].name);
+    char b[48]; snprintf(b, sizeof(b), "Following P%d %s  (%s)", cars[c].pos, cars[c].code, CLS[cars[c].cls].name);
     toast(b, 2500);
   } else if (followCar >= 0) {
     followCar = -1; toast("Free camera");
@@ -591,12 +586,9 @@ static int cameraCar() {
 // fit a 16-colour palette. If the 4-bit sprite can't be made (or its pixel
 // layout isn't what we expect), it falls back to a 16-bit sprite in PSRAM.
 enum : uint8_t { LBC_KEY = 0, LBC_WHITE, LBC_LIGHT, LBC_DIM, LBC_GAP, LBC_GOLD, LBC_ORANGE, LBC_PROTO, LBC_GT,
-                 LBC_FL, LBC_LEGEND, LBC_AGG, LBC_CAU, LBC_PAT, LBC_COUNT };
+                 LBC_FL, LBC_COUNT };
 static const uint32_t LB_PAL[LBC_COUNT] = { 0x000000u, 0xFFFFFFu, 0xC8D0D8u, 0xA8B4BCu, 0xE0E4E8u, 0xF0C040u, 0xFFA040u,
-                                            0x60C0FFu, 0xFFB040u, 0xC890FFu, 0x9AA6B0u, 0xFF5040u, 0x60A8FFu, 0x60D080u };
-static uint8_t traitLbc(uint8_t t) {
-  switch (t) { case TR_AGGRESSIVE: return LBC_AGG; case TR_CAUTIOUS: return LBC_CAU; case TR_PATIENT: return LBC_PAT; default: return LBC_GT; }
-}
+                                            0x60C0FFu, 0xFFB040u, 0xC890FFu };
 
 static LGFX_Sprite lbSpr(&display);
 static bool     lbOk = false, lbTried = false, lb4 = false, lbHiFirst = true;
@@ -657,7 +649,6 @@ static void lbText(const char* s, int x, int y, uint8_t c, const lgfx::IFont* fo
   if (lb4) lbSpr.setTextColor((uint32_t)c); else lbSpr.setTextColor(LB_PAL[c]);
   lbSpr.drawString(s, x, y);
 }
-static void lbDot(int x, int y, uint8_t c) { if (lb4) lbSpr.fillCircle(x, y, 2, (uint32_t)c); else lbSpr.fillCircle(x, y, 2, LB_PAL[c]); }
 
 static void initLeaderboardSprite() {
   lbTried = true;
@@ -712,7 +703,6 @@ static void rebuildLeaderboard() {
     snprintf(b, sizeof(b), "%d", k + 1);
     lbText(b, 18, yy, LBC_LIGHT, &fonts::DejaVu9, textdatum_t::middle_right);
     lbText(c.code, 29, yy, (c.state == CS_SPIN || c.state == CS_STOPPED) ? LBC_ORANGE : LBC_WHITE, &fonts::DejaVu9, textdatum_t::middle_left);
-    if (c.trait != TR_BALANCED) lbDot(55, yy, traitLbc(c.trait));
     if (raceSeries == SER_ENDURANCE) lbText(c.cls == CC_PROTO ? "P" : "GT", 61, yy, c.cls == CC_PROTO ? LBC_PROTO : LBC_GT, &fonts::DejaVu9, textdatum_t::middle_left);
     if (phase == RP_GRID) b[0] = 0;
     else if (c.finished) snprintf(b, sizeof(b), c.finishPos == 1 ? "WIN" : "FIN");
@@ -729,16 +719,7 @@ static void rebuildLeaderboard() {
     snprintf(b, sizeof(b), "FL %s %s", cars[fastestCar].code, t);
     lbText(b, 8, yy, LBC_FL, &fonts::DejaVu9, textdatum_t::middle_left);
   }
-  // Trait legend (Balanced drivers have no dot)
-  int ly = LB_HEAD + numCars * LB_ROW + (fastestCar >= 0 ? 22 : 10);
-  static const uint8_t LEG[4] = { TR_AGGRESSIVE, TR_CAUTIOUS, TR_PATIENT, TR_DEFENSIVE };
-  static const char* const LEG_TXT[4] = { "Agg", "Cau", "Pat", "Def" };
-  for (int k = 0; k < 4; ++k) {
-    int lx = 7 + k * 29;
-    lbDot(lx + 2, ly, traitLbc(LEG[k]));
-    lbText(LEG_TXT[k], lx + 7, ly, LBC_LEGEND, &fonts::DejaVu9, textdatum_t::middle_left);
-  }
-  lbH = ly + 9;
+  lbH = LB_HEAD + numCars * LB_ROW + (fastestCar >= 0 ? 17 : 4);
   lbBuiltMs = millis();
   lbDirty = true;
   buildLbRuns();
@@ -823,14 +804,12 @@ static void drawCarTag(int ci) {
   int x = (int)d.sx, y = (int)(d.sy - d.hl - 16);
   if (!stripHit(y - 9, y + 9) || x < 0 || x >= SCREEN_W) return;
   const Car& c = cars[ci];
-  char b[40]; snprintf(b, sizeof(b), "P%d %s  %s", c.pos, c.code, TRAITS[c.trait].name);
+  char b[24]; snprintf(b, sizeof(b), "P%d %s", c.pos, c.code);
   canvas.setFont(&fonts::DejaVu9);
   int w = canvas.textWidth(b) + 14;
   blendRoundRect(x - w / 2, y - 8, w, 16, 6, 0x06090Cu, 24);
   canvas.fillRect(x - w / 2 + 3, y - 5, 3, 10, c.c1);
   drawText(b, x + 3, y, 0xFFFFFFu, &fonts::DejaVu9, textdatum_t::middle_center);
-  int tw = canvas.textWidth(TRAITS[c.trait].name);
-  canvas.fillRect(x + 3 + canvas.textWidth(b) / 2 - tw, y + 5, tw, 1, TRAITS[c.trait].col);   // trait underline
 }
 
 // ─── Results panel: cached opaque 4-bit sprite (PSRAM) ───────────────────────
@@ -983,11 +962,11 @@ static void drawDriversPage() {
   drawText("Drivers", PANEL_X + 24, PANEL_Y + 26, 0xF4F8F8u, &fonts::DejaVu18, textdatum_t::middle_left);
   drawPanelButton(D_TOGGLE, customDrivers ? "Custom: On" : "Custom: Off", customDrivers ? 0xB0302Au : 0x3A4450u, 28);
   drawText(customDrivers ? "On: these drivers race (from the next race). Tap to edit."
-                         : "Off: random names and traits each race.",
+                         : "Off: random names each race.",
            PANEL_X + 24, PANEL_Y + 60, 0x9AA6B0u, &fonts::DejaVu9, textdatum_t::middle_left);
   char b[8];
   for (int k = 0; k < MAX_CARS; ++k) {
-    Rect n = dSlotName(k), t = dSlotTrait(k);
+    Rect n = dSlotName(k);
     if (!stripHit(n.y, n.y + n.h)) continue;
     const bool inRace = k < carSetting;                 // slots past the car count sit out
     const uint32_t txt = (customDrivers && inRace) ? 0xFFFFFFu : 0x7A8690u;
@@ -995,10 +974,6 @@ static void drawDriversPage() {
     drawText(b, n.x - 6, n.y + n.h / 2, 0x8A98A0u, &fonts::DejaVu9, textdatum_t::middle_right);
     blendRoundRect(n.x, n.y, n.w, n.h, 7, 0x3A4450u, 24);
     drawText(customCode[k], n.x + n.w / 2, n.y + n.h / 2, txt, &fonts::DejaVu12, textdatum_t::middle_center);
-    blendRoundRect(t.x, t.y, t.w, t.h, 7, 0x3A4450u, 24);
-    const TraitSpec& T = TRAITS[customTrait[k] < TR_COUNT ? customTrait[k] : TR_BALANCED];
-    fCircle(t.x + 12, t.y + t.h / 2, 4, inRace ? T.col : 0x5A646Cu);
-    drawText(T.name, t.x + 24, t.y + t.h / 2, txt, &fonts::DejaVu12, textdatum_t::middle_left);
   }
   drawPanelButton(P_NEXT_RACE, "Copy this race", 0x3A4450u);
   drawPanelButton(P_CLOSE, "Back", 0xB0302Au, 28);
