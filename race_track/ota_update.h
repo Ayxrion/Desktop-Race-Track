@@ -92,6 +92,7 @@ static void checkForOTAUpdate() {
         http.addHeader("User-Agent", "ESP32-RaceTrack/" FIRMWARE_VERSION);
         http.addHeader("Accept",     "application/vnd.github.v3+json");
         http.setTimeout(10000);
+        http.useHTTP10(true);   // no chunked transfer encoding: the JSON is parsed straight from the stream
         static const char* hdrs[] = {"Content-Type"};
         http.collectHeaders(hdrs, 1);
 
@@ -132,7 +133,8 @@ static void checkForOTAUpdate() {
             http.end();
 
             if (jerr) {
-                _otaStatus("OTA: JSON parse error");
+                snprintf(buf, sizeof(buf), "OTA: JSON parse error (%s)", jerr.c_str());
+                _otaStatus(buf);
                 delay(1500);
                 goto done;
             }

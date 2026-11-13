@@ -98,8 +98,11 @@ static void presentStrip(int b, int y, int hh, bool full) {
     esp_err_t e = esp_async_memcpy(dmaH, fbBase + (size_t)(y + first) * SCREEN_W * 2, stripBufs[b] + first * SCREEN_W,
                                    (size_t)n * SCREEN_W * 2, onStripCopied, stripFree[b]);
     if (e == ESP_OK) return;
-    Serial.printf("GDMA copy failed (%s) - falling back to CPU copy\n", esp_err_to_name(e));
-    useDma = false;
+    // Usually a brief internal-heap shortage (a TLS connection is open): copy this
+    // strip with the CPU and keep using GDMA, which is twice as fast, afterwards.
+    static uint32_t dmaFails = 0, dmaFailMs = 0;
+    ++dmaFails;
+    if (millis() - dmaFailMs > 5000) { Serial.printf("GDMA copy failed (%s), %u so far - CPU copy for this strip\n", esp_err_to_name(e), (unsigned)dmaFails); dmaFailMs = millis(); }
     xSemaphoreGive(stripFree[b]);
   }
   display.pushImage(0, y + first, SCREEN_W, n, (const lgfx::rgb565_t*)(stripBufs[b] + first * SCREEN_W));
@@ -177,6 +180,7 @@ static void beginNextRace() {
 }
 
 void setup() {
+  Serial.setTxBufferSize(4096);   // race log lines are written from both cores: don't stall on the UART
   Serial.begin(115200);
   _rng = esp_random() | 1u;
   Serial.printf("Race Track v%s\n", FIRMWARE_VERSION);
@@ -290,6 +294,7 @@ void loop() {
   if (now - lastFrameMs < FRAME_MS) { delay(1); return; }
   lastFrameMs = now;
   ++frameCount;
+  const uint32_t frameUs0 = micros();
 
   profT = micros();
   pollTouch();
@@ -372,6 +377,8 @@ void loop() {
   rowHashValid = true;
   PROF(8);
 
+  static uint32_t workUs = 0, workMax = 0, slowFrames = 0;   // frame work, excluding the wait for the next 30 Hz tick
+  { const uint32_t w = micros() - frameUs0; workUs += w; if (w > workMax) workMax = w; if (w > FRAME_MS * 1000u) ++slowFrames; }
   ++fpsFrames;
   if (now - fpsT0 >= 5000) {
     Serial.printf("fps %.1f  zoom %.2f  cars %d  lap %d  heap %u  psram %u  wifi %d  sim %.1f ms (core 0)\n",
@@ -390,6 +397,8 @@ void loop() {
     Serial.printf("  rows rendered/frame: %u, copied: %u of %d\n", (unsigned)(rowsRendered / fpsFrames),
                   (unsigned)(rowsCopied / fpsFrames), SCREEN_H);
     rowsCopied = rowsRendered = 0;
+    Serial.printf("  work avg %.1f max %.1f ms, over %d ms: %u frames\n", workUs / 1000.0f / fpsFrames, workMax / 1000.0f, FRAME_MS, (unsigned)slowFrames);
+    workUs = workMax = slowFrames = 0;
     fpsFrames = 0; fpsT0 = now;
   }
 }

@@ -52,6 +52,10 @@ static bool _wifiEnsureConnected() {
   return true;
 }
 
+// Set when the server rejects the API key: retrying can't help, and every TLS
+// connection briefly takes most of the free internal heap from the renderer.
+static bool _weatherKeyBad = false;
+
 static bool _fetchWeather(WeatherCondition& out) {
   if (!_wifiEnsureConnected()) return false;
 
@@ -69,7 +73,8 @@ static bool _fetchWeather(WeatherCondition& out) {
   if (http.begin(client, url)) {
     http.setTimeout(12000);
     int code = http.GET();
-    if (code != HTTP_CODE_OK) Serial.printf("Weather: HTTP %d%s\n", code, code == 401 ? " (API key rejected)" : "");
+    if (code != HTTP_CODE_OK) Serial.printf("Weather: HTTP %d%s\n", code, code == 401 ? " (API key rejected - not retrying until the next boot)" : "");
+    if (code == 401) _weatherKeyBad = true;
     if (code == HTTP_CODE_OK) {
       String body = http.getString();
       DynamicJsonDocument doc(1024);
@@ -98,7 +103,7 @@ static void _weatherTask(void*) {
   uint32_t lastMs = 0;
   bool first = true;
   for (;;) {
-    if (!weatherConfigured()) {          // no API key: just keep WiFi up for NTP time
+    if (!weatherConfigured() || (_weatherKeyBad && !_weatherKick)) {   // no usable API key: just keep WiFi up for NTP time
       _wifiEnsureConnected();
       vTaskDelay(pdMS_TO_TICKS(30000));
       continue;
