@@ -427,9 +427,11 @@ static void setupCars(int n, uint8_t series, uint32_t seed) {
 #define LEAD_EASE      0.015f   // ...backs off by up to this much (×), managing the gap
 // Pack racing (new AI): anyone can win from anywhere on the grid. Further back means more
 // speed down the straights (corners stay within grip), and a move down a straight gets a push.
-#define PACK_K         0.02f    // top speed (×) for a car PACK_T s or more behind the leader...
-#define PACK_T         5.0f
-#define POS_K          0.05f    // ...plus up to this much (×) by position, the most for last place
+// Both are measured within a car's own class, so GTs in an Endurance race chase the leading GT.
+#define PACK_K         0.045f   // top speed (×) for a car PACK_T1 s or more behind its class leader:
+#define PACK_T0        2.0f     // s: none within this of them, building smoothly to full at PACK_T1
+#define PACK_T1        8.0f
+#define POS_K          0.10f    // ...plus up to this much (×) by place in the class, the most for last
 #define PRESS_T        0.8f     // s: a car this close behind puts you under pressure...
 #define PRESSURE_MIST  2.0f     // ...and doubles your chance of a mistake
 #define COVER_T        0.35f    // s: only a car this close behind, and at least as quick, makes a driver cover the inside
@@ -551,6 +553,10 @@ static void updateCars(float dt, bool racing, bool coolDown) {
   ++simTick;
   const float formK = FORM_SD * sqrtf(2.0f * dt / FORM_TAU);   // the same for every car
   evN = 0;
+  // For the catch-up: each class's leader, and each car's place within its class
+  int clsLead[CC_COUNT], clsN[CC_COUNT], clsPos[MAX_CARS];
+  for (int k = 0; k < CC_COUNT; ++k) { clsLead[k] = -1; clsN[k] = 0; }
+  for (int k = 0; k < numCars; ++k) { const int j = order[k], cl = cars[j].cls; if (clsLead[cl] < 0) clsLead[cl] = j; clsPos[j] = ++clsN[cl]; }
   for (int i = 0; i < numCars; ++i) {
     Car& c = cars[i];
     const ClassSpec& cs = CLS[c.cls];
@@ -612,11 +618,12 @@ static void updateCars(float dt, bool racing, bool coolDown) {
         ease = LEAD_EASE * clampf((gapT - LEAD_EASE_T0) / 1.0f, 0, 1);
       }
       float pack = 0;
-      if (aiLines && racing && c.pos > 1 && !c.finished && raceTime > 5.0f) {
-        const Car& L = cars[order[0]];
-        const float avgV = fmx(L.dist / raceTime, 50.0f);           // the leader's average speed so far
-        pack = PACK_K * clampf((L.dist - c.dist) / avgV / PACK_T, 0, 1);
-        pack += POS_K * (c.pos - 1) / fmx(numCars - 1, 1);   // the further back, the more they find
+      if (aiLines && racing && !c.finished && raceTime > 5.0f && clsLead[c.cls] >= 0 && clsLead[c.cls] != i) {
+        const Car& L = cars[clsLead[c.cls]];
+        const float avgV = fmx(L.dist / raceTime, 50.0f);           // the class leader's average speed so far
+        const float x = clampf(((L.dist - c.dist) / avgV - PACK_T0) / fmx(PACK_T1 - PACK_T0, 0.1f), 0, 1);
+        const float sm = x * x * (3.0f - 2.0f * x);                  // eases in and out: no step to surge across
+        pack = PACK_K * sm + POS_K * (clsPos[i] - 1) / fmx(clsN[c.cls] - 1, 1);   // the further back, the more they find
       }
       const float fm = 1.0f + c.form - ease;
       float vT = V_TOP * cs.top * c.perf * T.straight * fm * (1.0f + pack);   // catching up: more speed down the straights

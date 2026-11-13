@@ -32,7 +32,7 @@ It uses the same board setup and rendering approach as the koi pond (Desktop Aqu
   Pulling out to pass, a driver keeps the tow's speed for a moment and gets a push to pass; the car they've just passed has to get back in the tow before attacking again.
   A driver committed to a move brakes later into the next corner, and once their nose is alongside on the inside, the other car usually gives way.
   A leader with a cushion manages the gap, and every driver's form drifts a little over a race, so gaps open and close.
-  Anyone can win from anywhere: there's no qualifying (the grid is random), and the further back a car is, the more speed it finds down the straights.
+  Anyone can win from anywhere: there's no qualifying (the grid is random), and the further back a car is in its class, the more speed it finds down the straights. That builds up gradually once a car is more than a couple of seconds off its class leader, so cars near the front race on merit.
   A car with someone right behind is more likely to make a mistake.
 - **Drivers** all race the same way, so no kind of driver has an edge. They differ in skill (how often they make mistakes), a little raw pace, their form on the day, and their own lines through corners.
   Every driver lets cars that are lapping them through (blue flags).
