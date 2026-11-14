@@ -4,7 +4,7 @@
 // event ticker, and the TV camera that runs when nobody is touching the screen.
 
 #include <WiFi.h>
-#include "settings.h"
+#include "champ.h"
 #include "version.h"
 
 #define UI_HIDE_MS        15000UL
@@ -32,7 +32,7 @@ enum UiId : int8_t {
   UI_P_SLIDER, UI_P_WX_PREV, UI_P_WX_NEXT, UI_P_TIME_PREV, UI_P_TIME_NEXT, UI_P_CARS_MINUS, UI_P_CARS_PLUS,
   UI_P_TRACK_PREV, UI_P_TRACK_NEXT, UI_P_LAPS_PREV, UI_P_LAPS_NEXT, UI_P_SER_PREV, UI_P_SER_NEXT,
   UI_P_CAM_PREV, UI_P_CAM_NEXT, UI_P_SPEC_PREV, UI_P_SPEC_NEXT,
-  UI_P_NEXT_RACE, UI_P_CLOSE, UI_P_DRIVERS, UI_COUNT
+  UI_P_NEXT_RACE, UI_P_CLOSE, UI_P_DRIVERS, UI_P_RECORDS, UI_COUNT
 };
 
 #define NUM_TOP_BTN 5
@@ -50,20 +50,21 @@ static const Rect BTN[NUM_TOP_BTN] = { { 572, 8, 50, 46 }, { 630, 8, 50, 46 }, {
 static const Rect P_SLIDER  = { CTRL_X, ROW_Y(0) - 4, 270, 38 };
 static const Rect P_ARROW_L(int row) { return { CTRL_X, (int16_t)(ROW_Y(row) - 2), 44, 34 }; }
 static const Rect P_ARROW_R(int row) { return { CTRL_R, (int16_t)(ROW_Y(row) - 2), 44, 34 }; }
-static const Rect P_NEXT_RACE = { PANEL_X + 24, PANEL_Y + PANEL_H - 52, 170, 40 };
-static const Rect P_CLOSE     = { PANEL_X + PANEL_W - 132, PANEL_Y + PANEL_H - 52, 108, 40 };
-static const Rect P_DRIVERS   = { PANEL_X + 24 + 170 + 14, PANEL_Y + PANEL_H - 52, 118, 40 };
+static const Rect P_NEXT_RACE = { PANEL_X + 24, PANEL_Y + PANEL_H - 52, 150, 40 };
+static const Rect P_DRIVERS   = { PANEL_X + 184, PANEL_Y + PANEL_H - 52, 100, 40 };
+static const Rect P_RECORDS   = { PANEL_X + 294, PANEL_Y + PANEL_H - 52, 100, 40 };
+static const Rect P_CLOSE     = { PANEL_X + PANEL_W - 96, PANEL_Y + PANEL_H - 52, 72, 40 };
 
 // Rows top to bottom: which control pair each row is (prev/next ids are adjacent).
 static const int8_t ROW_ID[PANEL_ROWS + 1] = { UI_NONE, UI_P_WX_PREV, UI_P_TIME_PREV, UI_P_CARS_MINUS, UI_P_TRACK_PREV,
                                                UI_P_SER_PREV, UI_P_LAPS_PREV, UI_P_CAM_PREV, UI_P_SPEC_PREV };
 
 // ─── Drivers page and its name keyboard ──────────────────────────────────────
-// panelPage 0 = settings, 1 = drivers, 2 = editing a driver's name.
+// panelPage 0 = settings, 1 = drivers, 2 = editing a driver's name, 3 = career records.
 static int  panelPage = 0;
 static int  editSlot = 0;
 static char editBuf[4] = "";
-enum : int { UI_D_TOGGLE = 100, UI_D_COPY, UI_D_BACK, UI_D_NAME0 = 110,
+enum : int { UI_D_TOGGLE = 100, UI_D_COPY, UI_D_BACK, UI_D_SEASON, UI_D_NAME0 = 110,
              UI_K_KEY0 = 200, UI_K_DEL = 250, UI_K_CANCEL, UI_K_OK };
 static const char KEYS[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 #define NUM_KEYS 36
@@ -73,7 +74,7 @@ static Rect kKey(int i)       { int col = i % 9, row = i / 9; return { (int16_t)
 static const Rect K_DEL = { PANEL_X + 24, PANEL_Y + 320, 130, 40 };
 static const Rect PANEL       = { PANEL_X, PANEL_Y, PANEL_W, PANEL_H };
 
-static uint32_t nextRaceArmUntil = 0;
+static uint32_t nextRaceArmUntil = 0, seasonArmUntil = 0;
 
 static bool uiVisible() { return panelOpen || (millis() - lastTouchMs < UI_HIDE_MS); }
 
@@ -90,9 +91,11 @@ static int hitPanel(int x, int y) {
       if (dSlotName(k).hit(x, y)) return UI_D_NAME0 + k;
     }
     if (P_NEXT_RACE.hit(x, y)) return UI_D_COPY;
+    if (P_DRIVERS.hit(x, y)) return UI_D_SEASON;
     if (P_CLOSE.hit(x, y)) return UI_D_BACK;
     return UI_NONE;
   }
+  if (panelPage == 3) return P_CLOSE.hit(x, y) ? UI_D_BACK : UI_NONE;
   if (panelPage == 2) {
     for (int i = 0; i < NUM_KEYS; ++i) if (kKey(i).hit(x, y)) return UI_K_KEY0 + i;
     if (K_DEL.hit(x, y)) return UI_K_DEL;
@@ -107,6 +110,7 @@ static int hitPanel(int x, int y) {
   }
   if (P_NEXT_RACE.hit(x, y)) return UI_P_NEXT_RACE;
   if (P_DRIVERS.hit(x, y)) return UI_P_DRIVERS;
+  if (P_RECORDS.hit(x, y)) return UI_P_RECORDS;
   if (P_CLOSE.hit(x, y)) return UI_P_CLOSE;
   return UI_NONE;
 }
@@ -183,7 +187,10 @@ static void closePanel() { panelOpen = false; panelPage = 0; saveSettings(); }
 static void driversAction(int id) {
   if (id == UI_D_TOGGLE) {
     customDrivers = !customDrivers;
-    toast(customDrivers ? "Custom drivers: from the next race" : "Random drivers: from the next race", 2200);
+    toast(customDrivers ? "Custom drivers: from the next race" : "Standard drivers: from the next race", 2200);
+  } else if (id == UI_D_SEASON) {                     // two taps: it wipes the standings
+    if (millis() < seasonArmUntil) { champReset(); seasonArmUntil = 0; toast("New season from the next race", 2200); }
+    else { seasonArmUntil = millis() + 3000; toast("Tap again to wipe the standings", 2600); }
   } else if (id == UI_D_COPY) {                       // start from the field that's racing now
     for (int i = 0; i < numCars && i < MAX_CARS; ++i) { memcpy(customCode[i], cars[i].code, 4); customCode[i][3] = 0; }
     toast("Copied this race's drivers", 1800);
@@ -211,6 +218,7 @@ static void panelAction(int id) {
   if (id >= 100) { driversAction(id); return; }
   switch (id) {
     case UI_P_DRIVERS: panelPage = 1; break;
+    case UI_P_RECORDS: panelPage = 3; break;
     case UI_P_WX_PREV: case UI_P_WX_NEXT: {
       int v = weatherOverride + (id == UI_P_WX_NEXT ? 1 : -1);
       if (v < -1) v = WEATHER_COUNT - 1;
@@ -586,9 +594,9 @@ static int cameraCar() {
 // fit a 16-colour palette. If the 4-bit sprite can't be made (or its pixel
 // layout isn't what we expect), it falls back to a 16-bit sprite in PSRAM.
 enum : uint8_t { LBC_KEY = 0, LBC_WHITE, LBC_LIGHT, LBC_DIM, LBC_GAP, LBC_GOLD, LBC_ORANGE, LBC_PROTO, LBC_GT,
-                 LBC_FL, LBC_COUNT };
+                 LBC_FL, LBC_DMG, LBC_OUT, LBC_COUNT };
 static const uint32_t LB_PAL[LBC_COUNT] = { 0x000000u, 0xFFFFFFu, 0xC8D0D8u, 0xA8B4BCu, 0xE0E4E8u, 0xF0C040u, 0xFFA040u,
-                                            0x60C0FFu, 0xFFB040u, 0xC890FFu };
+                                            0x60C0FFu, 0xFFB040u, 0xC890FFu, 0xFF5A48u, 0x6A7680u };
 
 static LGFX_Sprite lbSpr(&display);
 static bool     lbOk = false, lbTried = false, lb4 = false, lbHiFirst = true;
@@ -692,7 +700,7 @@ static void rebuildLeaderboard() {
   else if (raceLaps > 0)                              snprintf(b, sizeof(b), "LAP %d/%d", leaderLapDisplay(), raceLaps);
   else                                                snprintf(b, sizeof(b), "LAP %d", leaderLapDisplay());
   lbText(b, 8, 12, LBC_WHITE, &fonts::DejaVu12, textdatum_t::middle_left);
-  lbText(SERIES_NAMES[raceSeries], LB_W - 7, 12, LBC_GOLD, &fonts::DejaVu9, textdatum_t::middle_right);
+  lbText(scState != SC_NONE ? "SAFETY CAR" : SERIES_NAMES[raceSeries], LB_W - 7, 12, scState != SC_NONE ? LBC_ORANGE : LBC_GOLD, &fonts::DejaVu9, textdatum_t::middle_right);
   lbText(trk.name, 8, 27, LBC_DIM, &fonts::DejaVu9, textdatum_t::middle_left);
   lbN = numCars;
   for (int k = 0; k < numCars; ++k) {
@@ -702,16 +710,19 @@ static void rebuildLeaderboard() {
     lbSw[k] = toPx(rgbTo565(c.c1));
     snprintf(b, sizeof(b), "%d", k + 1);
     lbText(b, 18, yy, LBC_LIGHT, &fonts::DejaVu9, textdatum_t::middle_right);
-    lbText(c.code, 29, yy, (c.state == CS_SPIN || c.state == CS_STOPPED) ? LBC_ORANGE : LBC_WHITE, &fonts::DejaVu9, textdatum_t::middle_left);
+    lbText(c.code, 29, yy, c.out ? LBC_OUT : (c.state == CS_SPIN || c.state == CS_STOPPED) ? LBC_ORANGE : LBC_WHITE, &fonts::DejaVu9, textdatum_t::middle_left);
+    if (!c.out && c.dmg >= DMG_SHOW) lbSpr.fillRect(54, yy - 4, 3, 8, lb4 ? (uint32_t)LBC_DMG : LB_PAL[LBC_DMG]);   // damaged
     if (raceSeries == SER_ENDURANCE) lbText(c.cls == CC_PROTO ? "P" : "GT", 61, yy, c.cls == CC_PROTO ? LBC_PROTO : LBC_GT, &fonts::DejaVu9, textdatum_t::middle_left);
     if (phase == RP_GRID) b[0] = 0;
+    else if (c.out) snprintf(b, sizeof(b), "OUT");
+    else if (c.pit >= 2 && phase == RP_RACE) snprintf(b, sizeof(b), "PIT");
     else if (c.finished) snprintf(b, sizeof(b), c.finishPos == 1 ? "WIN" : "FIN");
     else if (k == 0) { if (c.lastLap > 0) fmtLapTime(b, sizeof(b), c.lastLap); else b[0] = 0; }
     else {
       float g = gapToLeader(order[k]);
       if (g < 0) snprintf(b, sizeof(b), "+%dL", (int)-g); else snprintf(b, sizeof(b), "+%.1f", g);
     }
-    if (b[0]) lbText(b, LB_W - 7, yy, k == 0 ? LBC_DIM : LBC_GAP, &fonts::DejaVu9, textdatum_t::middle_right);
+    if (b[0]) lbText(b, LB_W - 7, yy, c.out ? LBC_DMG : k == 0 ? LBC_DIM : LBC_GAP, &fonts::DejaVu9, textdatum_t::middle_right);
   }
   if (fastestCar >= 0) {
     int yy = LB_HEAD + numCars * LB_ROW + 8;
@@ -817,13 +828,15 @@ static void drawCarTag(int ci) {
 // copied into the strips: blending a 330×150 translucent panel and drawing its
 // text in every strip cost ~15 ms per frame.
 #define RES_W 330
-#define RES_H 150
+#define RES_H 280
 #define RES_X (SCREEN_CX - RES_W / 2 + 60)
 #define RES_Y (SCREEN_CY - RES_H / 2)
-enum : uint8_t { RSC_KEY = 0, RSC_BG, RSC_WHITE, RSC_LIGHT, RSC_INK, RSC_GOLD, RSC_SILVER, RSC_BRONZE, RSC_DIM, RSC_FAINT, RSC_CAR0 };
+enum : uint8_t { RSC_KEY = 0, RSC_BG, RSC_WHITE, RSC_LIGHT, RSC_INK, RSC_GOLD, RSC_SILVER, RSC_BRONZE, RSC_DIM, RSC_FAINT, RSC_CAR0,
+                 RSC_UP = 13, RSC_DOWN, RSC_NOTE };
 static LGFX_Sprite resSpr(&display);
 static bool     resOk = false, resTried = false, resHiFirst = true, resDirty = false;
-static int      resStride = 0, resSec = -1;
+static int      resStride = 0, resSec = -1, resPage = -1;
+static bool     resChamp = false;
 static uint16_t resPal565[16];
 
 static void resPal(int i, uint32_t rgb) { resSpr.setPaletteColor(i, rgb); resPal565[i] = toPx(rgbTo565(rgb)); }
@@ -848,44 +861,112 @@ static void initResultsSprite() {
   if (!resOk) { resSpr.deleteSprite(); return; }
   const uint32_t base[RSC_CAR0] = { 0x000000u, 0x0C1014u, 0xFFFFFFu, 0xC8D0D8u, 0x101010u, 0xF0C840u, 0xC8CCD0u, 0xD08A4Au, 0xA8B4BCu, 0x8A98A0u };
   for (int i = 0; i < RSC_CAR0; ++i) resPal(i, base[i]);
+  resPal(RSC_UP, 0x5CC870u); resPal(RSC_DOWN, 0xE06050u); resPal(RSC_NOTE, 0xF0D890u);
 }
 
-static void rebuildResults(int secLeft) {
+static void resPlace(int x, int y, int k, int r) {       // a place number, in a medal for the top three
+  char b[4]; snprintf(b, sizeof(b), "%d", k + 1);
+  if (k < 3) {
+    resSpr.fillCircle(x, y, r, (uint32_t)(RSC_GOLD + k));
+    resSpr.setFont(r >= 9 ? &fonts::DejaVu12 : &fonts::DejaVu9); resSpr.setTextDatum(textdatum_t::middle_center);
+    resSpr.setTextColor((uint32_t)RSC_INK); resSpr.drawString(b, x, y);
+  } else resText(b, x, y, RSC_LIGHT, &fonts::DejaVu9, textdatum_t::middle_center);
+}
+
+// Page 0: the race result (podium, then the rest), with championship points.
+static void buildRaceResult(int secLeft) {
+  for (int i = 0; i < RES_W - 28; i += 6)                       // chequered strip
+    for (int r = 0; r < 2; ++r) if (((i / 6) + r) & 1) resSpr.fillRect(14 + i, 10 + r * 6, 6, 6, (uint32_t)RSC_WHITE);
+  char b[56];
+  snprintf(b, sizeof(b), "%s  -  %s", trk.name, SERIES_NAMES[raceSeries]);
+  resText(b, RES_W / 2, 34, RSC_LIGHT, &fonts::DejaVu9, textdatum_t::middle_center);
+  if (champShown) {
+    snprintf(b, sizeof(b), "Season %u  -  race %u of %d", champ.season, champ.raceNo, SEASON_RACES);
+    resText(b, RES_W / 2, 48, RSC_FAINT, &fonts::DejaVu9, textdatum_t::middle_center);
+  }
+  for (int k = 0; k < 3 && k < numCars; ++k) {
+    const int i = order[k];
+    const Car& c = cars[i];
+    const int yy = 74 + k * 32;
+    resPal(RSC_CAR0 + k, c.c1);
+    resPlace(34, yy, k, 9);
+    resSpr.fillRect(52, yy - 8, 4, 16, (uint32_t)(RSC_CAR0 + k));
+    const bool note = champShown && resNote[k][0];
+    resText(c.code, 62, note ? yy - 5 : yy, RSC_WHITE, &fonts::DejaVu18, textdatum_t::middle_left);
+    if (note) resText(resNote[k], 62, yy + 10, RSC_NOTE, &fonts::DejaVu9, textdatum_t::middle_left);
+    if (champShown) {
+      snprintf(b, sizeof(b), "+%u", resPts[i]);
+      resText(b, RES_W - 18, yy - 5, RSC_WHITE, &fonts::DejaVu12, textdatum_t::middle_right);
+    }
+    if (c.bestLap > 0) {
+      char t[16]; fmtLapTime(t, sizeof(t), c.bestLap);
+      snprintf(b, sizeof(b), "best %s", t);
+      resText(b, RES_W - 18, champShown ? yy + 10 : yy, RSC_DIM, &fonts::DejaVu9, textdatum_t::middle_right);
+    }
+  }
+  // The rest of the field, in two columns
+  const int rows = 5, y0 = 178, rh = 14;
+  for (int k = 3; k < numCars && k < 3 + rows * 2; ++k) {
+    const int col = (k - 3) / rows, row = (k - 3) % rows, i = order[k];
+    const int x = 24 + col * 156, yy = y0 + row * rh;
+    resPlace(x, yy, k, 0);
+    resText(cars[i].code, x + 16, yy, RSC_WHITE, &fonts::DejaVu9, textdatum_t::middle_left);
+    if (champShown && resPts[i]) { snprintf(b, sizeof(b), "+%u", resPts[i]); resText(b, x + 120, yy, RSC_DIM, &fonts::DejaVu9, textdatum_t::middle_right); }
+  }
+  if (champShown && resFoot[0]) resText(resFoot, RES_W / 2, RES_H - 34, RSC_DIM, &fonts::DejaVu9, textdatum_t::middle_center);
+  if (champShown) snprintf(b, sizeof(b), "Standings in %d", secLeft);
+  else            snprintf(b, sizeof(b), "Next race in %d", secLeft);
+  resText(b, RES_W / 2, RES_H - 14, RSC_FAINT, &fonts::DejaVu9, textdatum_t::middle_center);
+}
+
+// Page 1: the championship standings.
+static void buildStandings(int secLeft) {
+  const bool champion = champ.raceNo >= SEASON_RACES;
+  resSpr.fillRect(14, 10, RES_W - 28, 4, (uint32_t)RSC_GOLD);
+  resText(standHead, RES_W / 2, 32, champion ? RSC_GOLD : RSC_WHITE, champion ? &fonts::DejaVu18 : &fonts::DejaVu12, textdatum_t::middle_center);
+  if (standSub[0]) resText(standSub, RES_W / 2, 52, RSC_DIM, &fonts::DejaVu9, textdatum_t::middle_center);
+  const int top = 72, avail = RES_H - 28 - top;
+  const bool two = standN > 12;
+  const int perCol = two ? (standN + 1) / 2 : standN;
+  const int rh = clampi(avail / (perCol > 0 ? perCol : 1), 12, 17);
+  char b[16];
+  for (int k = 0; k < standN; ++k) {
+    const StandRow& s = stand[k];
+    const int col = two ? k / perCol : 0, row = two ? k % perCol : k;
+    const int x = two ? 16 + col * 152 : 24, w = two ? 146 : RES_W - 48, yy = top + row * rh + rh / 2;
+    resPlace(x + 6, yy, k, rh >= 16 ? 7 : 6);
+    resText(s.code, x + 22, yy, RSC_WHITE, two ? &fonts::DejaVu9 : &fonts::DejaVu12, textdatum_t::middle_left);
+    if (!two) {
+      if (s.wins) { snprintf(b, sizeof(b), "%u win%s", s.wins, s.wins == 1 ? "" : "s"); resText(b, x + 92, yy, RSC_FAINT, &fonts::DejaVu9, textdatum_t::middle_left); }
+      if (s.moved) { snprintf(b, sizeof(b), "%+d", s.moved); resText(b, x + 168, yy, s.moved > 0 ? RSC_UP : RSC_DOWN, &fonts::DejaVu9, textdatum_t::middle_center); }
+    }
+    if (s.gained) { snprintf(b, sizeof(b), "+%u", s.gained); resText(b, x + w - 44, yy, RSC_DIM, &fonts::DejaVu9, textdatum_t::middle_right); }
+    snprintf(b, sizeof(b), "%u", s.pts);
+    resText(b, x + w, yy, RSC_WHITE, two ? &fonts::DejaVu9 : &fonts::DejaVu12, textdatum_t::middle_right);
+  }
+  char t[32];
+  if (champion) snprintf(t, sizeof(t), "New season in %d", secLeft);
+  else          snprintf(t, sizeof(t), "Next race in %d", secLeft);
+  resText(t, RES_W / 2, RES_H - 14, RSC_FAINT, &fonts::DejaVu9, textdatum_t::middle_center);
+}
+
+static void rebuildResults(int secLeft, int page) {
   if (!resTried) initResultsSprite();
   if (!resOk) return;
   resSpr.fillScreen((uint32_t)RSC_KEY);
   resSpr.fillRoundRect(0, 0, RES_W, RES_H, 14, (uint32_t)RSC_BG);
-  for (int i = 0; i < RES_W - 28; i += 6)                       // chequered strip
-    for (int r = 0; r < 2; ++r) if (((i / 6) + r) & 1) resSpr.fillRect(14 + i, 10 + r * 6, 6, 6, (uint32_t)RSC_WHITE);
-  char b[48];
-  snprintf(b, sizeof(b), "%s  -  %s", trk.name, SERIES_NAMES[raceSeries]);
-  resText(b, RES_W / 2, 36, RSC_LIGHT, &fonts::DejaVu9, textdatum_t::middle_center);
-  for (int k = 0; k < 3 && k < numCars; ++k) {
-    const Car& c = cars[order[k]];
-    int yy = 62 + k * 24;
-    resPal(RSC_CAR0 + k, c.c1);
-    resSpr.fillCircle(34, yy, 9, (uint32_t)(RSC_GOLD + k));
-    snprintf(b, sizeof(b), "%d", k + 1);
-    resSpr.setFont(&fonts::DejaVu12); resSpr.setTextDatum(textdatum_t::middle_center);
-    resSpr.setTextColor((uint32_t)RSC_INK); resSpr.drawString(b, 34, yy);
-    resSpr.fillRect(52, yy - 7, 4, 14, (uint32_t)(RSC_CAR0 + k));
-    resText(c.code, 62, yy, RSC_WHITE, &fonts::DejaVu18, textdatum_t::middle_left);
-    if (c.bestLap > 0) {
-      char t[16]; fmtLapTime(t, sizeof(t), c.bestLap);
-      snprintf(b, sizeof(b), "best %s", t);
-      resText(b, RES_W - 18, yy, RSC_DIM, &fonts::DejaVu9, textdatum_t::middle_right);
-    }
-  }
-  snprintf(b, sizeof(b), "Next race in %d", secLeft);
-  resText(b, RES_W / 2, RES_H - 14, RSC_FAINT, &fonts::DejaVu9, textdatum_t::middle_center);
+  if (page == 1) buildStandings(secLeft); else buildRaceResult(secLeft);
   resDirty = true;
 }
 
 static void prepareResults() {
   resDirty = false;
-  if (phase != RP_RESULTS) { resSec = -1; return; }
-  int sec = (int)fmx(0, RESULTS_SECONDS - phaseT) + 1;
-  if (sec != resSec) { resSec = sec; rebuildResults(sec); }
+  if (phase != RP_RESULTS) { resSec = -1; resPage = -1; return; }
+  const float standSecs = champFinal ? 20.0f : 14.0f;              // the standings get the end of the results time
+  const float pageAt = resultsSecs - standSecs;
+  const int page = champShown && phaseT >= pageAt ? 1 : 0;
+  const int sec = (int)fmx(0, (page == 0 && champShown ? pageAt : resultsSecs) - phaseT) + 1;
+  if (sec != resSec || page != resPage || champShown != resChamp) { resSec = sec; resPage = page; resChamp = champShown; rebuildResults(sec, page); }
 }
 
 static void drawResults() {
@@ -962,7 +1043,7 @@ static void drawDriversPage() {
   drawText("Drivers", PANEL_X + 24, PANEL_Y + 26, 0xF4F8F8u, &fonts::DejaVu18, textdatum_t::middle_left);
   drawPanelButton(D_TOGGLE, customDrivers ? "Custom: On" : "Custom: Off", customDrivers ? 0xB0302Au : 0x3A4450u, 28);
   drawText(customDrivers ? "On: these drivers race (from the next race). Tap to edit."
-                         : "Off: random names each race.",
+                         : "Off: the standard field.",
            PANEL_X + 24, PANEL_Y + 60, 0x9AA6B0u, &fonts::DejaVu9, textdatum_t::middle_left);
   char b[8];
   for (int k = 0; k < MAX_CARS; ++k) {
@@ -976,6 +1057,42 @@ static void drawDriversPage() {
     drawText(customCode[k], n.x + n.w / 2, n.y + n.h / 2, txt, &fonts::DejaVu12, textdatum_t::middle_center);
   }
   drawPanelButton(P_NEXT_RACE, "Copy this race", 0x3A4450u);
+  drawPanelButton(P_DRIVERS, "New season", 0x3A4450u);
+  drawPanelButton(P_CLOSE, "Back", 0xB0302Au, 28);
+}
+
+// Career records of this race's field: titles, then wins, then podiums.
+static void drawRecordsPage() {
+  drawText("Driver records", PANEL_X + 24, PANEL_Y + 26, 0xF4F8F8u, &fonts::DejaVu18, textdatum_t::middle_left);
+  char b[40];
+  if (champ.lastChamp[0]) snprintf(b, sizeof(b), "Season %u  -  last champion %.3s", champ.season, champ.lastChamp);
+  else                    snprintf(b, sizeof(b), "Season %u", champ.season);
+  drawText(b, PANEL_X + PANEL_W - 24, PANEL_Y + 26, 0x8A98A0u, &fonts::DejaVu9, textdatum_t::middle_right);
+  static const char* const HEAD[] = { "Starts", "Wins", "Podiums", "Poles", "Fast laps", "Titles", "Best run" };
+  static const int16_t COLX[] = { 150, 198, 252, 302, 358, 410, 462 };
+  const int hy = PANEL_Y + 62;
+  for (int c = 0; c < 7; ++c) drawText(HEAD[c], PANEL_X + COLX[c], hy, 0x8A98A0u, &fonts::DejaVu9, textdatum_t::middle_center);
+  const RecRow* rows[MAX_CARS]; int n = 0;
+  for (int i = 0; i < numCars; ++i) { const RecRow* r = recFind(cars[i].code, false); if (r) rows[n++] = r; }
+  std::sort(rows, rows + n, [](const RecRow* a, const RecRow* b) {
+    if (a->titles != b->titles) return a->titles > b->titles;
+    if (a->wins != b->wins) return a->wins > b->wins;
+    return a->pods > b->pods;
+  });
+  if (!n) drawText("No finished races yet.", PANEL_X + PANEL_W / 2, PANEL_Y + 140, 0x9AA6B0u, &fonts::DejaVu12, textdatum_t::middle_center);
+  for (int k = 0; k < n; ++k) {
+    const RecRow& r = *rows[k];
+    const int yy = PANEL_Y + 84 + k * 16;
+    if (!stripHit(yy - 8, yy + 8)) continue;
+    if (k & 1) blendRect(PANEL_X + 16, yy - 8, PANEL_W - 32, 16, 0xFFFFFFu, 3);
+    snprintf(b, sizeof(b), "%.3s", r.code);
+    drawText(b, PANEL_X + 40, yy, 0xFFFFFFu, &fonts::DejaVu12, textdatum_t::middle_left);
+    const unsigned v[7] = { r.starts, r.wins, r.pods, r.poles, r.fastLaps, r.titles, r.bestStreak };
+    for (int c = 0; c < 7; ++c) {
+      snprintf(b, sizeof(b), "%u", v[c]);
+      drawText(b, PANEL_X + COLX[c], yy, c == 5 && r.titles ? 0xF0C840u : (v[c] ? 0xE0E6EAu : 0x5A6670u), &fonts::DejaVu9, textdatum_t::middle_center);
+    }
+  }
   drawPanelButton(P_CLOSE, "Back", 0xB0302Au, 28);
 }
 
@@ -1007,6 +1124,7 @@ static void drawPanel() {
   canvas.drawRoundRect(PANEL_X, PANEL_Y, PANEL_W, PANEL_H, 14, 0x7A8088u);
   if (panelPage == 1) { drawDriversPage(); return; }
   if (panelPage == 2) { drawKeyboardPage(); return; }
+  if (panelPage == 3) { drawRecordsPage(); return; }
   drawText("Race settings", PANEL_X + 24, PANEL_Y + 26, 0xF4F8F8u, &fonts::DejaVu18, textdatum_t::middle_left);
   char buf[48];
   snprintf(buf, sizeof(buf), "v%s  WiFi %s", FIRMWARE_VERSION, WiFi.status() == WL_CONNECTED ? "on" : "off");
@@ -1038,6 +1156,7 @@ static void drawPanel() {
   blendRoundRect(P_NEXT_RACE.x, P_NEXT_RACE.y, P_NEXT_RACE.w, P_NEXT_RACE.h, 10, armed ? 0xB02A20u : 0x3A4450u, 26);
   drawText(armed ? "Tap again" : "Next race now", P_NEXT_RACE.x + P_NEXT_RACE.w / 2, P_NEXT_RACE.y + P_NEXT_RACE.h / 2, 0xFFFFFFu, &fonts::DejaVu12, textdatum_t::middle_center);
   drawPanelButton(P_DRIVERS, customDrivers ? "Drivers: On" : "Drivers", customDrivers ? 0x7A2A26u : 0x3A4450u);
+  drawPanelButton(P_RECORDS, "Records", 0x3A4450u);
   blendRoundRect(P_CLOSE.x, P_CLOSE.y, P_CLOSE.w, P_CLOSE.h, 10, 0xB0302Au, 28);
   drawText("Done", P_CLOSE.x + P_CLOSE.w / 2, P_CLOSE.y + P_CLOSE.h / 2, 0xFFFFFFu, &fonts::DejaVu12, textdatum_t::middle_center);
 }

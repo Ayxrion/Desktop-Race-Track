@@ -166,7 +166,9 @@ static void beginNextRace() {
 #ifdef RT_QUICK_RACE
   raceLaps = 1;
 #endif
+  champPrepareRace(carSetting, series, raceLaps);
   startRace(carSetting, series, seed);
+  champGridTicker();
   char sub[64];
   if (raceLaps > 0) snprintf(sub, sizeof(sub), "%s  -  %d cars  -  %d laps", SERIES_NAMES[series], numCars, raceLaps);
   else              snprintf(sub, sizeof(sub), "%s  -  %d cars", SERIES_NAMES[series], numCars);
@@ -191,6 +193,7 @@ void setup() {
   display.setRotation(0);
   display.setBrightness(200);
   loadSettings();
+  champLoad();
   display.setBrightness(brightness);
 
   splash("Checking for updates...");
@@ -277,7 +280,7 @@ static void markRows(int y0, int y1) {
 }
 static void markDynamicRows() {
   memset(dynNow, 0, sizeof(dynNow));
-  for (int i = 0; i < numCars; ++i) if (cdraw[i].vis) markRows(cdraw[i].y0, cdraw[i].y1);
+  for (int i = 0; i < drawN; ++i) if (cdraw[i].vis) markRows(cdraw[i].y0, cdraw[i].y1);
   for (int i = 0; i < pdN; ++i) markRows(pd[i].y0 - 2, pd[i].y1 + 2);
   uiDynamicRows(markRows);
 }
@@ -288,6 +291,7 @@ static uint32_t rowsRendered = 0;
 
 void loop() {
   simJoin();                                   // the sim batch kicked last frame has finished
+  champTick();                                 // a race just finished: score it (the sim is idle)
   if (nextRaceRequested) { beginNextRace(); lastFrameMs = millis(); }
 
   uint32_t now = millis();

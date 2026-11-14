@@ -19,6 +19,11 @@ static float seenLap[MAX_CARS];
 static int   prevTop[3] = { -1, -1, -1 };
 
 #define RESULTS_SECONDS 16.0f
+static float resultsSecs = RESULTS_SECONDS;   // longer with the championship standings to show
+static float scT = 0;                         // how long the safety car has been out
+static int   scLeadLap = -1;                  // the leader's lap when it pulled off (racing resumes at the line)
+static int   scOutLap = 0;                    // the leader's lap when it came out (it stays out for a lap at least)
+static char  gridMsg[2][56] = { "", "" };     // ticker lines while the cars sit on the grid (pole, the title race)
 
 // ─── Event ticker ─────────────────────────────────────────────────────────────
 static char     evMsg[56] = "";
@@ -73,7 +78,7 @@ static void logRaceEnd() {
   for (int k = 0; k < numCars; ++k) {
     const Car& c = cars[order[k]];
     const int inc = c.incidents[EV_SPIN] + c.incidents[EV_WALL] + c.incidents[EV_GRAVEL] + c.incidents[EV_CONTACT];
-    Serial.printf("RL RES %d %s grid %d best %.3f inc %d laps %d\n", k + 1, c.code, gridSlot[order[k]], c.bestLap, inc, c.finished ? c.finishLaps : c.lap);
+    Serial.printf("RL RES %d %s grid %d best %.3f inc %d laps %d dmg %.2f%s\n", k + 1, c.code, gridSlot[order[k]], c.bestLap, inc, c.finished ? c.finishLaps : c.lap, c.dmg, c.out ? " OUT" : "");
   }
 }
 
@@ -85,6 +90,8 @@ static void fmtLapTime(char* out, size_t n, float t) {
 
 // ─── Race control ─────────────────────────────────────────────────────────────
 static void startRace(int nCars, uint8_t series, uint32_t seed) {
+  allowRetire = raceLaps > 0;                 // endless races: damage slows a car, but nobody is put out
+  simLaps = raceLaps;                         // for planning pit stops
   setupCars(nCars, series, seed);
   initEffects();
   phase = RP_GRID; phaseT = 0; raceTime = 0; lightsOn = 0;
@@ -94,12 +101,43 @@ static void startRace(int nCars, uint8_t series, uint32_t seed) {
   for (int i = 0; i < MAX_CARS; ++i) seenLap[i] = 0;
   prevTop[0] = prevTop[1] = prevTop[2] = -1;
   evMsg[0] = 0;
+  scState = SC_NONE; scShow = false; scT = 0; scLeadLap = -1;
+}
+
+// The safety car: out after a retirement (unless the race is nearly over), in once the wreck is off the
+// road and the field has closed up behind it.
+static void updateSafetyCarCall(float dt) {
+  if (scState == SC_NONE) return;
+  scT += dt;
+  if (scState == SC_OUT) {
+    bool cleared = true, bunched = true;
+    const Car* prev = nullptr;
+    for (int k = 0; k < numCars; ++k) {
+      const Car& c = cars[order[k]];
+      if (c.out) { if (!c.parked) cleared = false; continue; }
+      if (c.pit >= 2) continue;
+      if (prev && prev->dist - c.dist < trk.L * 0.5f && (prev->dist - c.dist) / fmx(c.v, 40.0f) > 1.6f) bunched = false;
+      prev = &c;
+    }
+    if (cleared && cars[order[0]].lap > scOutLap && ((bunched && scT > 20.0f) || scT > 75.0f)) {
+      scState = SC_IN; lastEventT = -100; raceEvent("Safety car in this lap", 0, 3500);
+      Serial.printf("RL SC %.1f in\n", raceTime);
+    }
+  } else if (scState == SC_RESTART) {
+    if (scLeadLap < 0) scLeadLap = cars[order[0]].lap;
+    else if (cars[order[0]].lap > scLeadLap) {
+      scState = SC_NONE; scLeadLap = -1; lastEventT = -100; raceEvent("GREEN FLAG - RACING RESUMES!", 0, 3500);
+      Serial.printf("RL SC %.1f green\n", raceTime);
+    }
+  }
 }
 
 static void updateRace(float dt) {
   phaseT += dt;
   if (phase == RP_GRID) {
     lightsOn = phaseT < 1.5f ? 0 : clampi((int)((phaseT - 1.5f) / 0.9f) + 1, 0, 5);
+    if (phaseT - dt < 0.4f && phaseT >= 0.4f && gridMsg[0][0]) raceEvent(gridMsg[0], 0, 2700);
+    if (phaseT - dt < 3.3f && phaseT >= 3.3f && gridMsg[1][0]) raceEvent(gridMsg[1], 0, 2700);
     updateCars(dt, false, false);
     if (phaseT >= goAt) { phase = RP_RACE; phaseT = 0; lightsOn = 0; raceEvent("LIGHTS OUT!", 0, 2200); logRaceStart(); }
     updateOrder();
@@ -112,18 +150,21 @@ static void updateRace(float dt) {
   if (phase == RP_RACE && raceLaps > 0 && cars[order[0]].lap >= raceLaps) {
     phase = RP_FINISH; phaseT = 0;
     for (int i = 0; i < numCars; ++i) cars[i].lapsAtFlag = cars[i].lap;
+    scState = SC_NONE; scShow = false;          // a finish under the safety car: it pulls off at the flag
   }
   if (phase == RP_FINISH || phase == RP_RESULTS) {
+    int outN = 0;
     for (int k = 0; k < numCars; ++k) {
       Car& c = cars[order[k]];
+      if (c.out) { ++outN; continue; }
       if (c.finished) continue;
       if (c.lap >= raceLaps || c.lap > c.lapsAtFlag) {
         c.finished = true; c.finishPos = ++finishCount; c.finishLaps = c.lap;
         if (c.finishPos == 1) { char b[48]; snprintf(b, sizeof(b), "CHEQUERED FLAG - %s WINS!", c.code); raceEvent(b, 0, 5000); }
       }
     }
-    if (phase == RP_FINISH && (finishCount >= numCars || phaseT > 50)) { phase = RP_RESULTS; phaseT = 0; logRaceEnd(); }
-    if (phase == RP_RESULTS && phaseT > RESULTS_SECONDS) nextRaceRequested = true;
+    if (phase == RP_FINISH && (finishCount + outN >= numCars || phaseT > 50)) { phase = RP_RESULTS; phaseT = 0; logRaceEnd(); }
+    if (phase == RP_RESULTS && phaseT > resultsSecs) nextRaceRequested = true;
   }
   updateOrder();
 
@@ -132,16 +173,29 @@ static void updateRace(float dt) {
   for (int e = 0; e < evN; ++e) {
     const SimEvent& ev = evQ[e];
     const Car& A = cars[ev.a];
-    if (phase == RP_RACE) { ++logInc; Serial.printf("RL INC %.1f %d %s %s\n", raceTime, (int)ev.type, A.code, ev.b >= 0 && ev.b < numCars ? cars[ev.b].code : "-"); }
+    if (phase == RP_RACE && ev.type <= EV_GRAVEL) { ++logInc; Serial.printf("RL INC %.1f %d %s %s\n", raceTime, (int)ev.type, A.code, ev.b >= 0 && ev.b < numCars ? cars[ev.b].code : "-"); }
+    if (phase == RP_RACE && ev.type == EV_OUT) Serial.printf("RL OUT %.1f %s lap %d\n", raceTime, A.code, A.lap);
     switch (ev.type) {
       case EV_SPIN:    snprintf(b, sizeof(b), "%s spins!", A.code); raceEvent(b, 1.0f); spinCamCar = ev.a; break;
       case EV_WALL:    snprintf(b, sizeof(b), "%s hits the wall!", A.code); raceEvent(b, 0.5f); spinCamCar = ev.a; break;
       case EV_CONTACT: snprintf(b, sizeof(b), "Contact! %s and %s", A.code, cars[ev.b].code); raceEvent(b, 1.0f); spinCamCar = ev.b; break;
       case EV_GRAVEL:  if (A.pos <= 6) { snprintf(b, sizeof(b), "%s runs into the gravel", A.code); raceEvent(b, 6.0f); } break;
+      case EV_PIT:     if (phase == RP_RACE) { Serial.printf("RL PIT %.1f %s lap %d P%d wear %.2f dmg %.2f\n", raceTime, A.code, A.lap, A.pos, A.wear, A.dmg);
+                         if (A.pos <= 6) { snprintf(b, sizeof(b), "%s pits from P%d", A.code, A.pos); raceEvent(b, 2.0f); } } break;
+      case EV_DAMAGE:  snprintf(b, sizeof(b), "%s is damaged and losing time", A.code); raceEvent(b, 2.0f); break;
+      case EV_OUT:
+        spinCamCar = ev.a; lastEventT = -100;
+        if (phase == RP_RACE && scState == SC_NONE && raceLaps - cars[order[0]].lap >= 3 && raceTime > 12.0f) {
+          scDeploy(); scT = 0; scOutLap = cars[order[0]].lap;
+          snprintf(b, sizeof(b), "SAFETY CAR - %s is out of the race", A.code); raceEvent(b, 0, 5000);
+          Serial.printf("RL SC %.1f out\n", raceTime);
+        } else { snprintf(b, sizeof(b), "%s is out of the race!", A.code); raceEvent(b, 0, 4500); }
+        break;
     }
   }
   evN = 0;
   if (phase != RP_RACE) return;
+  updateSafetyCarCall(dt);
   logRaceStep();
   // Fastest laps
   for (int i = 0; i < numCars; ++i) {

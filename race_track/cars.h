@@ -107,20 +107,28 @@ struct Car {
   int   pos;
   int   nextCorner;
   int8_t surface;           // 0 track, 1 gravel, 2 grass
-  uint16_t incidents[4];    // per EvType, this race
+  uint16_t incidents[8];    // per EvType, this race
+  float dmg;                // damage from hits: 0 none .. 1 out of the race (slower on the straights and in the corners)
+  bool  out, parked;        // retired; and moved off the road, where the others ignore it
+  bool  ghost;              // ignored by the others: parked off the road, or in the pit lane
+  float wear, wearK;        // tyre wear (0 new .. 1 worn out) and how much a lap adds
+  int8_t pit;               // 0 racing, 1 heading for the pits, 2 in the lane, 3 stopped, 4 leaving
+  uint8_t pitDone; int16_t pitLap; bool repaired;   // stops made, the planned lap, damage fixed
+  float pitT, pitBox;       // time left at the stop; where its garage is (signed s)
+  float dPark, outT;        // where it's being pushed to, and how long ago it retired
   float dbgVT; int8_t dbgAhead;   // last target speed / car followed (debugging)
   float progT, progDist;          // progress watchdog
   float planS, planU, planV2;     // last full corner plan: where it was made, and the corner point that set the speed (u ahead, its speed²)
   uint8_t planMode;               // what kind of plan that was (own line, beside another car, ...)
 };
-static Car cars[MAX_CARS];
+static Car cars[MAX_CARS + 1];          // (+1: the safety car)
 static int numCars = 14;
 static int order[MAX_CARS];
 static uint8_t raceSeries = SER_FORMULA;
 static float raceTime = 0;
 
 // ─── Simulation events for the race director (race.h) ─────────────────────────
-enum EvType : uint8_t { EV_SPIN, EV_WALL, EV_CONTACT, EV_GRAVEL };
+enum EvType : uint8_t { EV_SPIN, EV_WALL, EV_CONTACT, EV_GRAVEL, EV_DAMAGE, EV_OUT, EV_PIT };
 struct SimEvent { uint8_t type; int8_t a, b; };
 static SimEvent evQ[8];
 static int evN = 0;
@@ -136,6 +144,22 @@ static const char* const DRIVER_CODES[] = {
 // instead of a random one. Saved in NVS by settings.h.
 static bool    customDrivers = false;
 static char    customCode[MAX_CARS][4];
+
+// The championship field (champ.h sets these before each race). Car i is always the same driver: the
+// user's slot i, or the standard name for that slot. Each driver keeps a pace, a skill and their colours
+// for the whole season, and the grid comes from qualifying.
+static bool     rosterOn = false;
+static uint32_t rosterSeed = 1;          // the season's: who is quick, and the team colours
+static uint32_t rosterProtoMask = 0;     // Endurance: which cars get prototypes (0 = the first third)
+static int      poleCar = -1;            // who qualified on pole
+static const char* rosterCode(int i) { return customDrivers && customCode[i][0] ? customCode[i] : DRIVER_CODES[i % NUM_CODES]; }
+static uint32_t codeHash(const char* s) { uint32_t h = 2166136261u; for (; *s; ++s) h = (h ^ (uint8_t)*s) * 16777619u; return h; }
+// A driver's pace and skill for the season (the same ranges the random field uses).
+static void seasonAbility(const char* code, uint32_t seed, float& perf, float& skill) {
+  const uint32_t h = hash32(codeHash(code) ^ (seed * 2654435761u)), h2 = hash32(h + 0x9E3779B9u);
+  perf  = 0.988f + 0.012f * (float)(h & 0xFFFF) / 65535.0f;
+  skill = 0.86f + 0.13f * (float)(h2 & 0xFFFF) / 65535.0f;
+}
 
 static const uint32_t TEAM_COLS[][3] = {
   { 0xD8202Au, 0xF0F0F0u, 0xF0D020u }, { 0x1E3A8Au, 0xF0C020u, 0xE02020u }, { 0x0A7A5Au, 0xE8E8E8u, 0x40E0B0u },
@@ -341,6 +365,193 @@ static inline void IRAM_ATTR lineCurEval(const LineCur& lc, float u, const Track
 }
 static inline float lineCurD(const LineCur& lc, float u, const TrackPt& P) { float d, k; lineCurEval(lc, u, P, d, k); return d; }
 
+// ─── Damage ───────────────────────────────────────────────────────────────────
+// A hard hit on the wall or another car does damage. A damaged car is slower down the straights and has
+// less grip, and smokes when it's bad; enough damage puts it out of the race (not in endless races).
+#define DMG_TOP        0.035f   // top speed lost (×) at full damage
+#define DMG_GRIP       0.030f   // and grip
+#define DMG_SHOW       0.35f    // from here it's called out, shown on the leaderboard, and smokes
+static bool allowRetire = true;
+static float sideLimit(float s, int side, float halfW, bool& wall);
+static void addDamage(Car& c, int i, float amt) {
+  if (c.out || amt <= 0) return;
+  const float before = c.dmg;
+  c.dmg += amt;
+  if (c.dmg >= 1.0f && allowRetire && !c.finished) {
+    c.out = true; c.dmg = 1.0f; c.outT = 0;
+    c.state = CS_STOPPED; c.stopT = 1e9f; c.v = 0; c.spinV = 0; c.passT = 0;
+    const int side = c.d >= 0 ? 1 : 0;                // off the road on the side it's nearest
+    bool wall; const float lim = sideLimit(c.s, side, CLS[c.cls].wid * 0.5f, wall);
+    const float want = trk.hw + KERB_W + CLS[c.cls].wid * 0.7f;
+    c.dPark = (side ? 1.0f : -1.0f) * fmn(want, lim);
+    pushEv(EV_OUT, i);
+  } else {
+    if (c.dmg > 0.97f) c.dmg = 0.97f;                // endless races: badly damaged, but still going
+    if (before < DMG_SHOW && c.dmg >= DMG_SHOW) pushEv(EV_DAMAGE, i);
+  }
+}
+
+// ─── Safety car ───────────────────────────────────────────────────────────────
+// After a car is put out of the race, a safety car leads the field round at a steady pace. Nobody may pass
+// (except a stricken car); the cars behind close up and follow in line. When the wreck is cleared it pulls
+// off at the end of a lap, and racing resumes when the leader crosses the line. race.h decides when; the
+// safety car itself is cars[numCars]: drawn like a car, never raced.
+enum ScState : uint8_t { SC_NONE, SC_OUT, SC_IN, SC_RESTART };   // OUT: leading; IN: in this lap; RESTART: gone, no passing until the line
+static uint8_t scState = SC_NONE;
+static bool    scShow = false;            // the safety car is on the track (drawn)
+static bool    scPeel = false;            // pulling off
+static float   scPeelT = 0;
+static float   scCap[MAX_CARS];           // each car's speed limit behind the car ahead (px/s)
+#define SC_SPEED   0.62f                  // × the racing speed profile
+#define SC_GAP_T   0.55f                  // s: following distance in the queue
+#define SC_FREE    220.0f                 // px: further back than this, a car closes up at racing speed
+static inline int numDraw() { return numCars + (scShow ? 1 : 0); }
+
+static void scDeploy() {
+  const Car& L = cars[order[0]];
+  Car& S = cars[numCars];
+  memset(&S, 0, sizeof(S));
+  S.cls = CC_GT; S.c1 = 0xD0D4D8u; S.c2 = 0x24282Cu; S.c3 = 0xF0B020u;
+  memcpy(S.code, "SC", 3);
+  S.dist = L.dist + 170.0f; S.s = wrapS(S.dist);
+  S.d = S.dPath = tp[idxAt(S.s)].rl;
+  S.v = fmx(fmn(L.v, tp[idxAt(S.s)].v * SC_SPEED), 50.0f);
+  S.state = CS_RACE;
+  placeOnTrack(S);
+  TrackFrame f; trackAt(S.s, f); S.heading = atan2f(f.ty, f.tx);
+  S.px = S.x; S.py = S.y;
+  scState = SC_OUT; scShow = true; scPeel = false; scPeelT = 0;
+}
+
+static void updateSafetyCar(float dt) {
+  if (!scShow) return;
+  Car& S = cars[numCars];
+  const float vt = fmn(tp[idxAt(S.s)].v, tp[idxAt(S.s + 45.0f)].v) * SC_SPEED * (scPeel ? 0.55f : 1.0f);
+  S.v += clampf(vt - S.v, -A_BRK * 0.8f * dt, A_ACC * 0.9f * dt);
+  S.braking = vt < S.v - 2.0f;
+  S.dist += S.v * dt; S.s = wrapS(S.dist);
+  // In this lap: off the road just before the line, then gone
+  if (scState == SC_IN && !scPeel && S.s > trk.L - 230.0f && S.s < trk.L - 120.0f) scPeel = true;
+  float dT = tp[idxAt(S.s)].rl;
+  if (scPeel) {
+    scPeelT += dt;
+    dT = trk.hw + KERB_W + CLS[S.cls].wid;            // to the right, off the racing surface
+    if (scPeelT > 3.5f) { scShow = false; scState = SC_RESTART; }
+  }
+  S.d += clampf(dT - S.d, -14.0f * dt, 14.0f * dt);
+  S.dPath = S.d;
+  S.px = S.x; S.py = S.y;
+  placeOnTrack(S);
+  const float mx = S.x - S.px, my = S.y - S.py;
+  if (mx * mx + my * my > 1e-4f) S.heading = atan2f(my, mx);
+}
+
+// Each running car's speed limit for this step: follow the car ahead (or the safety car) at a steady gap.
+static void scCaps() {
+  const Car* ahead = (scState == SC_OUT || (scState == SC_IN && scShow && !scPeel)) ? &cars[numCars] : nullptr;
+  for (int k = 0; k < numCars; ++k) {
+    const int i = order[k];
+    Car& c = cars[i];
+    scCap[i] = 1e9f;
+    if (c.out || c.finished || c.pit >= 2) continue;
+    if (ahead) {
+      const float lenAvg = (CLS[c.cls].len + CLS[ahead->cls].len) * 0.5f;
+      const float gap = ahead->dist - c.dist;
+      const float want = SC_GAP_T * fmx(ahead->v, 40.0f) + lenAvg;
+      if (gap < want + SC_FREE) scCap[i] = clampf(ahead->v + 0.8f * (gap - want), ahead->v * 0.3f, ahead->v + 60.0f);
+    }
+    ahead = &c;
+  }
+}
+
+// ─── Tyres and pit stops ──────────────────────────────────────────────────────
+// Tyres wear as a car laps and lose grip, slowly at first and then faster. In a race of 8 laps or more
+// every car plans one stop, somewhere around half distance, and it comes in earlier for a safety car
+// or to have heavy damage repaired. A stop is a drive down the pit lane at the speed limit, a stop at
+// the car's own garage (new tyres, and repairs if it needs them), and back out onto the track.
+#define TW_GRIP     0.06f      // grip lost (×) at wear 1 (it goes with wear²)
+#define PIT_V       45.0f      // px/s: the pit lane speed limit
+#define PIT_TAPER   28.0f      // px: the lane's entry and exit (as world.h draws it)
+static int simLaps = 0;        // the race's length (race.h), for planning stops
+
+static inline float pitLaneD(float sS) {        // the pit lane's centre at signed s (world.h's geometry)
+  const float a = trk.pitS0, b = trk.pitS1;
+  const float t = smooth01(sS < a + PIT_TAPER ? (sS - a) / PIT_TAPER : (sS > b - PIT_TAPER ? (b - sS) / PIT_TAPER : 1.0f));
+  return trk.pitSide * (trk.hw + 8.0f * t + 5.25f);
+}
+
+// Plan a car's tyres at the start: how fast they wear, and on which lap it stops.
+static void planTyres(Car& c, int i) {
+  c.wear = 0; c.pit = 0; c.pitDone = 0; c.pitLap = -1; c.repaired = false;
+  const float k = frandr(0.92f, 1.08f);                       // some are easier on their tyres
+  if (!trk.hasPits) c.wearK = k / (fmx((float)simLaps, 10.0f) * 1.6f);
+  else if (simLaps == 0) c.wearK = k / 12.0f;                 // endless: in when they're worn
+  else if (simLaps < 8) c.wearK = k / (simLaps * 1.5f);       // too short to stop
+  else {
+    c.wearK = k / (simLaps * 0.72f);                          // one stop: worn out by the flag without it
+    c.pitLap = (int16_t)clampi((int)lroundf(simLaps * frandr(0.35f, 0.62f)), 2, simLaps - 2);
+  }
+  const float m0 = trk.pitS0 + PIT_TAPER + 6.0f, m1 = trk.pitS1 - PIT_TAPER - 6.0f;
+  const int cells = clampi((int)((m1 - m0) / 12.0f), 1, 64);
+  c.pitBox = m0 + 12.0f * ((i % cells) + 0.5f);                // in front of its own garage
+}
+
+// Should this car come in at the end of this lap? (Decided before the pit entry.)
+static bool wantsPit(const Car& c, bool racing) {
+  if (!trk.hasPits || !racing || c.finished || c.out || c.pit) return false;
+  if (simLaps > 0 && c.lap + 1 >= simLaps) return false;      // not on the last lap
+  if (c.dmg >= 0.5f && !c.repaired && (simLaps == 0 || simLaps - c.lap > 2)) return true;   // repairs
+  if (simLaps == 0) return c.wear > 0.8f;
+  if (c.pitLap < 0 || c.pitDone) return false;
+  if (c.lap + 1 >= c.pitLap) return true;                     // the plan
+  // a cheap stop under the safety car, if new tyres would last from here to the flag
+  return scState != SC_NONE && c.pitLap - (c.lap + 1) <= 4 && (simLaps - (c.lap + 1)) * c.wearK <= 0.9f;   // (wearK: wear per lap)
+}
+
+// In the pit lane: driven along it, not raced. Returns false once back on the track.
+static void pitDrive(Car& c, int i, float dt) {
+  const float sS = sSigned(c.s);
+  float vt = PIT_V;
+  if (c.pit == 2) {                                            // to the garage
+    const float toBox = c.pitBox - sS;
+    vt = fmn(vt, sqrtf(2.0f * A_BRK * 0.45f * fmx(0.0f, toBox)) + 2.0f);
+    if (toBox <= 0.5f) {
+      c.pit = 3; c.v = 0;
+      c.pitT = frandr(2.2f, 3.0f);                             // new tyres
+      if (c.dmg >= DMG_SHOW) { c.pitT += frandr(3.0f, 5.0f); c.repaired = true; }   // and a new nose
+    }
+  }
+  if (c.pit == 3) {                                            // stopped
+    c.v = 0; vt = 0;
+    c.pitT -= dt;
+    if (c.pitT <= 0) { c.pit = 4; c.wear = 0; if (c.repaired) c.dmg = fmn(c.dmg, 0.05f); }
+  }
+  if (c.pit == 4 && sS >= trk.pitS1) {                         // the end of the lane: racing again
+    c.pit = 0; c.ghost = false; ++c.pitDone;
+    c.dPath = c.d; c.passT = 0; c.passCd = 1.0f; c.state = CS_RACE; c.kappa = 0;
+    TrackFrame f; trackAt(c.s, f); c.heading = atan2f(f.ty, f.tx);
+    return;
+  }
+  if (c.pit != 3) c.v += clampf(vt - c.v, -A_BRK * dt, A_ACC * 0.8f * dt);
+  const float ds = c.v * dt;
+  c.dist += ds; c.s = wrapS(c.s + ds);
+  // Stopping and stopped cars pull over to the garage side of the lane; the others drive by on the inner side.
+  const bool atBox = c.pit == 3 || (c.pit == 2 && c.pitBox - sSigned(c.s) < 25.0f);
+  float dWant = pitLaneD(sSigned(c.s)) + trk.pitSide * (atBox ? 2.5f : -2.0f);
+  if (c.pit == 4) {                                            // the lane ends beside the track: merge onto it before then
+    const float e0 = trk.pitS1 - PIT_TAPER - 12.0f;
+    const float u = smooth01((sSigned(c.s) - e0) / (trk.pitS1 - e0));
+    dWant = lerpf(dWant, trk.pitSide * (trk.hw - CLS[c.cls].wid * 0.5f - 0.5f), u);
+  }
+  c.d += clampf(dWant - c.d, -18.0f * dt, 18.0f * dt);
+  c.dPath = c.d; c.braking = vt < c.v - 2.0f;
+  c.px = c.x; c.py = c.y;
+  placeOnTrack(c);
+  const float mx = c.x - c.px, my = c.y - c.py;
+  if (mx * mx + my * my > 1e-4f) c.heading = atan2f(my, mx);
+  (void)i;
+}
+
 static void setupCars(int n, uint8_t series, uint32_t seed) {
   uint32_t save = _rng;
   _rng = seed * 2246822519u + 77u; if (!_rng) _rng = 1;
@@ -351,6 +562,7 @@ static void setupCars(int n, uint8_t series, uint32_t seed) {
   for (int i = 0; i < NUM_CODES; ++i) codes[i] = i;
   for (int i = NUM_CODES - 1; i > 0; --i) { int j = irandr(0, i + 1); int t = codes[i]; codes[i] = codes[j]; codes[j] = t; }
   int teamOff = irandr(0, NUM_TEAMS);
+  if (rosterOn) teamOff = (int)(hash32(rosterSeed) % NUM_TEAMS);   // the same colours all season
   float quali[MAX_CARS];
   for (int i = 0; i < numCars; ++i) {
     Car& c = cars[i];
@@ -360,7 +572,7 @@ static void setupCars(int n, uint8_t series, uint32_t seed) {
       case SER_TOURING:   c.cls = CC_TOURING; break;
       case SER_CLASSIC:   c.cls = CC_CLASSIC; break;
       case SER_VANS:      c.cls = CC_VAN; break;
-      case SER_ENDURANCE: c.cls = (i < (numCars + 2) / 3) ? CC_PROTO : CC_GT; break;
+      case SER_ENDURANCE: c.cls = (rosterOn && rosterProtoMask ? ((rosterProtoMask >> i) & 1) : i < (numCars + 2) / 3) ? CC_PROTO : CC_GT; break;
       default:            c.cls = CC_FORMULA; break;
     }
     if (series == SER_FORMULA) {
@@ -376,7 +588,7 @@ static void setupCars(int n, uint8_t series, uint32_t seed) {
     }
     memcpy(c.code, DRIVER_CODES[codes[i % NUM_CODES]], 3); c.code[3] = 0;
     c.num = (uint8_t)irandr(1, 99);
-    if (customDrivers && customCode[i][0]) { memcpy(c.code, customCode[i], 4); c.code[3] = 0; }   // the user's own field
+    if (rosterOn || (customDrivers && customCode[i][0])) { memcpy(c.code, rosterCode(i), 3); c.code[3] = 0; }   // the season's (or the user's own) field
     // Driving style: their own quirks.
     c.stApex = clampf(frandr(-0.4f, 0.4f), -1, 1);
     c.stKerb = clampf(frandr(-0.7f, 0.4f), -1, 1);
@@ -388,11 +600,20 @@ static void setupCars(int n, uint8_t series, uint32_t seed) {
     c.skill = frandr(0.86f, 0.99f);
     c.react = frandr(0.05f, 0.45f);
     c.commit = 1.0f;
-    quali[i] = frandr(-0.015f, 0.015f);   // no qualifying: a random grid, so pole is no head start for the quickest
+    planTyres(c, i);
+    quali[i] = frandr(-0.015f, 0.015f);   // without a championship: a random grid
+    if (rosterOn) {
+      float p, sk; seasonAbility(c.code, rosterSeed, p, sk);
+      c.perf = clampf(p + frandr(-0.002f, 0.002f), 0.985f, 1.002f);   // their pace for the season, give or take the day
+      c.skill = sk;
+      // Qualifying: one flying lap each. The quickest usually take pole; a mistake costs a few places.
+      quali[i] = CLS[c.cls].top + c.perf + frandr(-0.003f, 0.003f) - (frand() < (1.0f - c.skill) * 1.5f ? frandr(0.002f, 0.008f) : 0.0f);   // (prototypes ahead of GTs)
+    }
   }
   int gridOrd[MAX_CARS];
   for (int i = 0; i < numCars; ++i) gridOrd[i] = i;
   std::sort(gridOrd, gridOrd + numCars, [&](int a, int b) { return quali[a] > quali[b]; });
+  poleCar = gridOrd[0];
   for (int k = 0; k < numCars; ++k) {
     Car& c = cars[gridOrd[k]];
     c.dist = gridSlotS(k);
@@ -557,22 +778,51 @@ static void updateCars(float dt, bool racing, bool coolDown) {
   int clsLead[CC_COUNT], clsN[CC_COUNT], clsPos[MAX_CARS];
   for (int k = 0; k < CC_COUNT; ++k) { clsLead[k] = -1; clsN[k] = 0; }
   for (int k = 0; k < numCars; ++k) { const int j = order[k], cl = cars[j].cls; if (clsLead[cl] < 0) clsLead[cl] = j; clsPos[j] = ++clsN[cl]; }
+  if (scState != SC_NONE && racing) scCaps();
+  updateSafetyCar(dt);
   for (int i = 0; i < numCars; ++i) {
     Car& c = cars[i];
     const ClassSpec& cs = CLS[c.cls];
     const DriverSpec& T = DRV;
+    if (c.out) {                                       // retired: pushed off the road, smoking for a while
+      c.outT += dt; c.v = 0;
+      if (!c.parked && c.outT > 1.5f) {
+        const float step = 7.0f * dt;
+        c.d += clampf(c.dPark - c.d, -step, step);
+        if (fabsf(c.dPark - c.d) < 0.3f) { c.d = c.dPark; c.parked = c.ghost = true; }
+        c.dPath = c.d; c.px = c.x; c.py = c.y;
+        placeOnTrack(c);
+      }
+      if (c.outT < 25.0f && frand() < 0.25f * (1.0f - c.outT / 25.0f))
+        spawnParticle(PT_SMOKE, c.x, c.y, frandr(-0.3f, 0.3f), frandr(-0.3f, 0.3f), 2.2f, 0.10f, 40);
+      continue;
+    }
+    if (c.pit == 1 && racing) {                         // into the pit lane at its entry
+      const float sS = sSigned(c.s);
+      if (sS >= trk.pitS0 && sS < trk.pitS1) { c.pit = 2; c.ghost = true; pushEv(EV_PIT, i); }
+    }
+    if (c.pit >= 2) { pitDrive(c, i, dt); continue; }
+    if (wantsPit(c, racing)) {                           // decided a little before the entry
+      const float toEntry = trk.pitS0 - sSigned(c.s);
+      if (toEntry > 200.0f && toEntry < 330.0f) { c.pit = 1; c.passT = 0; }
+    }
+    if (racing) c.wear = fmn(c.wear + c.wearK * c.v * dt / trk.L, 1.3f);
+    if (c.dmg >= DMG_SHOW && c.v > 20.0f && frand() < (c.dmg - 0.25f) * 0.18f) {   // a damaged car trails smoke
+      const float back = -cs.len * 0.5f;
+      spawnParticle(PT_SMOKE, c.x + fastCos(c.heading) * back, c.y + fastSin(c.heading) * back, frandr(-0.2f, 0.2f), frandr(-0.2f, 0.2f), 1.6f, 0.06f, 24);
+    }
     TrackFrame f; trackAt(c.s, f);
     const float fi0 = wrapS(c.s) * simInvDs;      // this car's place in the track samples
     const float trackAng = atan2f(f.ty, f.tx);
     const float hwC = hw - cs.wid * 0.5f - 0.8f;
     const float gCar = cs.grip * c.perf * c.perf;
     const float surfG = c.surface == 0 ? 1.0f : (c.surface == 1 ? 0.45f : 0.55f);
-    float aLatMax = A_LAT * gCar * wx * 1.12f * surfG;                 // what the tyres can really do
+    float aLatMax = A_LAT * gCar * wx * 1.12f * surfG * (1.0f - DMG_GRIP * c.dmg) * (1.0f - TW_GRIP * c.wear * c.wear);   // what the tyres can really do
     if (aiLines && c.state == CS_RACE && fabsf(tpU(fi0, 0.0f).rk) > 1.0f / 300.0f) {
       // Dirty air: right behind another car in a corner, the front tyres lose some bite.
       float closest = 1e9f;
       for (int j = 0; j < numCars; ++j) {
-        if (j == i) continue;
+        if (j == i || cars[j].ghost) continue;
         const Car& o = cars[j];
         float g = sDelta(c.s, o.s);
         if (g > 4.0f && g < closest && fabsf(o.d - c.d) < cs.wid * 1.2f && o.state == CS_RACE) closest = g;
@@ -626,7 +876,8 @@ static void updateCars(float dt, bool racing, bool coolDown) {
         pack = PACK_K * sm + POS_K * (clsPos[i] - 1) / fmx(clsN[c.cls] - 1, 1);   // the further back, the more they find
       }
       const float fm = 1.0f + c.form - ease;
-      float vT = V_TOP * cs.top * c.perf * T.straight * fm * (1.0f + pack);   // catching up: more speed down the straights
+      float vT = V_TOP * cs.top * c.perf * T.straight * fm * (1.0f + pack) * (1.0f - DMG_TOP * c.dmg);   // catching up: more speed down the straights
+      if (scState != SC_NONE && racing) vT = fmn(vT, scCap[i]);                // behind the safety car: in line
       const float vTopCap = vT;                    // straight-line target, before corners, tow and traffic
       c.vTop = vTopCap;
       float limMin = 1e18f;                        // (speed²) the corners ahead allow from here
@@ -763,7 +1014,7 @@ static void updateCars(float dt, bool racing, bool coolDown) {
         const float towRange = fmx(c.v, 60.0f) * TOW_T1;
         float towG = towRange;
         for (int j = 0; j < numCars; ++j) {
-          if (j == i) continue;
+          if (j == i || cars[j].ghost) continue;
           const Car& o = cars[j];
           float g = sDelta(c.s, o.s);
           if (g > cs.len && g < towG && fabsf(o.d - c.d) < (cs.wid + CLS[o.cls].wid) * 0.5f + 2.0f && o.state == CS_RACE) towG = g;
@@ -784,7 +1035,7 @@ static void updateCars(float dt, bool racing, bool coolDown) {
       int attacker = -1; float attackGap = 1e9f;
       int behind = -1; float behindGap = 1e9f;
       for (int j = 0; j < numCars; ++j) {
-        if (j == i) continue;
+        if (j == i || cars[j].ghost) continue;
         const Car& o = cars[j];
         float g = sDelta(c.s, o.s);
         float widAvg = (cs.wid + CLS[o.cls].wid) * 0.5f;
@@ -818,7 +1069,7 @@ static void updateCars(float dt, bool racing, bool coolDown) {
         // a driver may swing wide and try to go round (more so if they cover the inside).
         const bool cornerMove = aiLines && cornerNear && !lapping && !obstacle && gap < lenAvg * OUTSIDE_GAP && c.v > a.v - 3.0f &&
                                 frand() < OUTSIDE_RATE * (a.coverT > 0 ? 2.0f : 1.0f) * OUTSIDE_RATE_K * dt;
-        if (c.passT <= 0 && c.passCd <= 0 && ((faster && allowed) || cornerMove) && gap < passWin && racing && !coolDown) {
+        if (c.passT <= 0 && c.passCd <= 0 && ((faster && allowed) || cornerMove) && gap < passWin && racing && !coolDown && (scState == SC_NONE || obstacle)) {
           const float hwP = hwC + PASS_EDGE;       // stays on the track proper
           // room either side of them, now and where their line takes them next
           float roomR = 1e9f, roomL = 1e9f;
@@ -945,7 +1196,7 @@ static void updateCars(float dt, bool racing, bool coolDown) {
       if (racing && c.state == CS_RACE) {
         const float edgeR = hwC + PASS_EDGE;
         for (int j = 0; j < numCars; ++j) {
-          if (j == i) continue;
+          if (j == i || cars[j].ghost) continue;
           const Car& o = cars[j];
           if (o.state != CS_RACE || o.v < 15.0f || c.v < 15.0f) continue;   // a slow scramble: the normal traffic rules handle it
           float lenAvg = (cs.len + CLS[o.cls].len) * 0.5f, widAvg = (cs.wid + CLS[o.cls].wid) * 0.5f;
@@ -961,6 +1212,13 @@ static void updateCars(float dt, bool racing, bool coolDown) {
       if (!racing || raceTime < c.react) { vT = 0; dT = c.d; }
       c.dbgVT = vT; c.dbgAhead = (int8_t)ahead;
 
+      if (c.pit == 1) {                              // heading for the pits: over to that side, down to the limit by the entry
+        const float toEntry = trk.pitS0 - sSigned(c.s);
+        // across to the pit side only on the straight before the entry (not in the corner before it)
+        dT = lerpf(dT, trk.pitSide * (hw - cs.wid * 0.5f - 0.5f), smooth01((130.0f - toEntry) / 90.0f));
+        c.passT = 0;
+        if (toEntry < 170.0f) vT = fmn(vT, sqrtf(PIT_V * PIT_V + 2.0f * A_BRK * 0.7f * fmx(0.0f, toEntry)));
+      }
       // ── Lane: the offset of the line being followed eases toward the target ──
       float laneRate = 0.24f * c.v + (c.v > 4.0f ? 5.0f : 0.0f);
       float oldPath = c.dPath;
@@ -1119,6 +1377,10 @@ static void updateCars(float dt, bool racing, bool coolDown) {
           c.state = CS_STOPPED; c.stopT = frandr(1.5f, 3.0f); c.v = 0; c.spinV = 0;
           for (int k = 0; k < 5; ++k) spawnParticle(PT_SMOKE, c.x, c.y, frandr(-0.5f, 0.5f), frandr(-0.5f, 0.5f), 2.0f, 0.15f, 30);
           pushEv(EV_WALL, i);
+#ifdef RT_DEBUG_SPIN
+          printf("  wallhit %s vPerp %.1f dmg %.2f\n", c.code, vPerp, c.dmg);
+#endif
+          addDamage(c, i, (0.25f + 0.95f * clampf((vPerp - 28.0f) / 40.0f, 0, 1)) * frandr(0.6f, 1.4f));
         }
       } else {
         c.v *= 0.97f;
@@ -1140,6 +1402,7 @@ static void updateCars(float dt, bool racing, bool coolDown) {
   for (int i = 0; i < numCars; ++i)
     for (int j = i + 1; j < numCars; ++j) {
       Car& a = cars[i]; Car& b = cars[j];
+      if (a.out || b.out || a.ghost || b.ghost) continue;   // a retired car is avoided, never pushed; the pit lane is apart
       float lenAvg = (CLS[a.cls].len + CLS[b.cls].len) * 0.5f, widAvg = (CLS[a.cls].wid + CLS[b.cls].wid) * 0.5f;
       float g = sDelta(a.s, b.s);
       if (fabsf(g) > lenAvg) continue;
@@ -1153,6 +1416,8 @@ static void updateCars(float dt, bool racing, bool coolDown) {
       if (hard) {
         rear.contactCd = front.contactCd = 4.0f;
         rear.v *= 0.85f; front.v *= 0.95f;
+        const float hit = (0.06f + 0.30f * clampf((closing - 6.0f) / 30.0f, 0, 1)) * frandr(0.5f, 1.5f);
+        addDamage(rear, ri, hit); addDamage(front, fi, hit * 0.5f);   // the nose takes the worst of it
         if (frand() < 0.08f) {
 #ifdef RT_DEBUG_SPIN
           printf("  spin-contact %s by %s s=%.0f\n", front.code, rear.code, front.s);
@@ -1182,9 +1447,10 @@ static void updateCars(float dt, bool racing, bool coolDown) {
   // ── Corners, laps, timing ──
   for (int i = 0; i < numCars; ++i) {
     Car& c = cars[i];
+    if (c.out) continue;
     // Progress watchdog: a car that's tangled up somewhere (pinned against
     // another car, or facing the wrong way) re-orients and pulls away.
-    if (racing && raceTime > c.react + 3.0f && !c.finished) {
+    if (racing && raceTime > c.react + 3.0f && !c.finished && !c.pit) {
       c.progT += dt;
       if (c.progT >= 3.0f) {
         if (c.dist - c.progDist < 3.0f && c.state == CS_RACE) { c.state = CS_RECOVER; c.v = 0; c.kappa = 0; }
@@ -1199,7 +1465,7 @@ static void updateCars(float dt, bool racing, bool coolDown) {
         if (aiLines && racing && c.state == CS_RACE && c.passT <= 0 && c.cutback < 0 && frand() < SETUP_RATE) {
           // right behind someone into this corner: wide entry, late apex, for a better exit and the tow
           for (int j = 0; j < numCars; ++j) {
-            if (j == i) continue;
+            if (j == i || cars[j].ghost) continue;
             float g = sDelta(c.s, cars[j].s);
             if (g > 0 && g < fmx(c.v, 40.0f) * SETUP_T && cars[j].state == CS_RACE) {
               c.cutback = (int8_t)c.nextCorner; planCornerLine(c, i, c.nextCorner); break;
@@ -1238,6 +1504,8 @@ static void updateOrder() {
   for (int i = 0; i < numCars; ++i) order[i] = i;
   std::sort(order, order + numCars, [](int a, int b) {
     const Car& A = cars[a]; const Car& B = cars[b];
+    if (A.out != B.out) return B.out;                  // retired cars last, the latest to retire first
+    if (A.out) return A.dist > B.dist;
     if (A.finished && B.finished) return A.finishLaps != B.finishLaps ? A.finishLaps > B.finishLaps : A.finishPos < B.finishPos;
     if (A.finished) return A.finishLaps >= B.lapsAtFlag + 1;
     if (B.finished) return B.finishLaps < A.lapsAtFlag + 1;
@@ -1271,13 +1539,15 @@ static int nearestCar(float wx, float wy, float maxD) {
 
 // ─── Drawing ──────────────────────────────────────────────────────────────────
 struct CarDraw { float sx, sy, ca, sa, hl, hwd; int y0, y1; bool vis; uint32_t l1, l2, l3; };   // l1..l3: livery, lit
-static CarDraw cdraw[MAX_CARS];
+static CarDraw cdraw[MAX_CARS + 1];
 // Shared car colours, lit for this frame (worked out once, not in every strip)
 static uint32_t litTyre, litGlass, litDark, litLamp, litWhite, litRack;
 
+static int drawN = 0;                        // cars drawn this frame (the field, and the safety car when it's out)
 static void prepareCarsFrame() {
   const float z = cam.zoom;
-  for (int i = 0; i < numCars; ++i) {
+  drawN = numDraw();
+  for (int i = 0; i < drawN; ++i) {
     const Car& c = cars[i];
     CarDraw& d = cdraw[i];
     const ClassSpec& cs = CLS[c.cls];
@@ -1320,7 +1590,7 @@ static void IRAM_ATTR cWheels(const CarDraw& d, float fx0, float fx1, float rx0,
 static void IRAM_ATTR drawCarShadows() {
   uint32_t a = (uint32_t)(4 + 8 * sunAmt);
   float off = 1.5f * cam.zoom;
-  for (int i = 0; i < numCars; ++i) {
+  for (int i = 0; i < drawN; ++i) {
     CarDraw d = cdraw[i];
     if (!d.vis || !stripHit(d.y0, d.y1)) continue;
     d.sx += off; d.sy += off * 1.3f;
@@ -1334,7 +1604,7 @@ static void IRAM_ATTR drawCarShadows() {
 static void IRAM_ATTR drawHeadlights() {
   if (nightAmt < 0.3f) return;
   uint32_t a = (uint32_t)(2 + 6 * (nightAmt - 0.3f) / 0.7f);
-  for (int i = 0; i < numCars; ++i) {
+  for (int i = 0; i < drawN; ++i) {
     const CarDraw& d = cdraw[i];
     if (!d.vis || !stripHit(d.y0, d.y1) || cars[i].state == CS_SPIN) continue;
     int ax, ay, bx, by, cx, cy;
@@ -1435,10 +1705,16 @@ static void IRAM_ATTR drawCarBody(int i) {
 }
 
 static void IRAM_ATTR drawCars(int highlight) {
-  for (int i = 0; i < numCars; ++i) {
+  for (int i = 0; i < drawN; ++i) {
     const CarDraw& d = cdraw[i];
     if (!d.vis || !stripHit(d.y0, d.y1)) continue;
     drawCarBody(i);
+    if (i == numCars && d.hl >= 4.0f) {         // the safety car's light bar, flashing
+      const bool ph = (millis() / 260) & 1;
+      int ax, ay, bx, by; carPt(d, 0.0f, -0.4f, ax, ay); carPt(d, 0.0f, 0.4f, bx, by);
+      const int r = (int)fmx(1.0f, cam.zoom * 0.7f);
+      fCircle(ax, ay, r, ph ? 0xFFB020u : 0x604010u); fCircle(bx, by, r, ph ? 0x604010u : 0xFFB020u);
+    }
     if (i == highlight) blendRing((int)d.sx, (int)d.sy, d.hl + 5, 2, 0xFFFFFFu, 18);
   }
 }

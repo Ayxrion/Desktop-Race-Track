@@ -32,14 +32,23 @@ It uses the same board setup and rendering approach as the koi pond (Desktop Aqu
   Pulling out to pass, a driver keeps the tow's speed for a moment and gets a push to pass; the car they've just passed has to get back in the tow before attacking again.
   A driver committed to a move brakes later into the next corner, and once their nose is alongside on the inside, the other car usually gives way.
   A leader with a cushion manages the gap, and every driver's form drifts a little over a race, so gaps open and close.
-  Anyone can win from anywhere: there's no qualifying (the grid is random), and the further back a car is in its class, the more speed it finds down the straights. That builds up gradually once a car is more than a couple of seconds off its class leader, so cars near the front race on merit.
+  Races stay open: the further back a car is in its class, the more speed it finds down the straights. That builds up gradually once a car is more than a couple of seconds off its class leader, so cars near the front race on merit.
   A car with someone right behind is more likely to make a mistake.
 - **Drivers** all race the same way, so no kind of driver has an edge. They differ in skill (how often they make mistakes), a little raw pace, their form on the day, and their own lines through corners.
+  Pace and skill are set for a whole season, so every season has its favourites and its underdogs.
   Every driver lets cars that are lapping them through (blue flags).
-- **Race weekend loop**: cars form up on a random grid behind the start lights, race for the set number of laps, and take the chequered flag.
-  The podium is shown, and then the next circuit is built.
+- **Damage**: a hard hit on the wall or another car does damage. A damaged car loses some top speed and grip, trails smoke and gets a red mark on the leaderboard; a big enough crash puts it out of the race, and it's pushed off the road where it smokes for a while. A retirement scores no points. In endless races damage slows a car but never puts it out.
+- **Safety car**: after a retirement (unless there are fewer than 3 laps to go) the safety car comes out ahead of the leader with its lights flashing. Nobody may pass, and the field closes up behind it. Once the wreck is off the road and a lap has gone by, it's *in this lap*: it pulls off before the line, and racing resumes when the leader crosses it.
+- **Tyres and pit stops**: tyres wear as a car laps and lose grip, slowly at first and then faster. In a race of 8 laps or more every driver plans one stop around half distance, and comes in early for a cheap stop under the safety car, or to have heavy damage repaired. A stop is a drive down the pit lane at the speed limit, new tyres at the car's own garage (a new nose too, if it needs one), and back out: about 9 seconds in all. Tracks without a pit lane, and short races, have no stops.
+- **Race weekend loop**: a quick qualifying sets the grid (the quickest drivers usually start at the front, but a mistake costs places), the cars form up behind the start lights, race for the set number of laps, and take the chequered flag.
+  The result is shown, then the championship standings, and then the next circuit is built.
   Races can also be endless.
-- **Timing**: positions, gaps to the leader (or laps down), last laps, the fastest lap, and a ticker for lead changes, passes for the podium, fastest laps and spins.
+- **Championship**: a season is 10 races, scored 25-18-15-12-10-8-6-4-2-1 by place in class, so in Endurance the first GT scores as much as the first prototype. The prototypes go to whoever has had the fewest so far, and each driver keeps their team colours for the season.
+  The standings show points, wins and places gained or lost; the last race crowns the champion, and the next one starts a new season with new favourites. A title clinched early is called out.
+  Endless races don't count. The standings are saved to flash, so a season carries on after a reboot.
+- **Driver records**: career starts, wins, podiums, poles, fastest laps, titles and the longest winning run, kept across seasons (Settings → *Records*).
+  The results call out first wins and podiums, winning runs, wins from far back and big climbs, and the grid ticker announces pole.
+- **Timing**: positions, gaps to the leader (or laps down), cars in the pits, retirements, last laps, the fastest lap, and a ticker for lead changes, passes for the podium, fastest laps, spins, damage, pit stops and the safety car.
 - **Weather** from OpenWeatherMap: rain and storms make the track darker and wetter and slow the cars, which throw up spray. Storms add lightning, snow whitens the grass, and fog washes the view out.
 - **Day and night** from NTP time. At night the circuit is floodlit, cars run headlights and tail lights, and camera flashes go off in the grandstands.
 - **OTA updates** from this repo's GitHub releases.
@@ -53,7 +62,7 @@ It uses the same board setup and rendering approach as the koi pond (Desktop Aqu
 | Pinch, or **−** / **+** | Zoom between the whole track (0.5×) and close-up (2.5×) |
 | ☰ (list) | Show or hide the leaderboard |
 | 📺 (TV) | Spectator mode on or off |
-| ⚙ (gear) | Settings: brightness, weather (Auto or forced), time (Real / Fast / Day / Night), number of cars, track (Rotate / Random / a preset), car type (Random or one series), race length, camera, spectator, **Drivers**, and *Next race now* (tap twice) |
+| ⚙ (gear) | Settings: brightness, weather (Auto or forced), time (Real / Fast / Day / Night), number of cars, track (Rotate / Random / a preset), car type (Random or one series), race length, camera, spectator, **Drivers**, **Records**, and *Next race now* (tap twice) |
 | *(no touch for 30 s)* | The **TV camera** takes over again |
 
 **Camera** (in settings) picks what the TV camera shows:
@@ -73,7 +82,8 @@ Pressing buttons or changing settings doesn't stop the TV camera either way.
 Settings are saved to flash (NVS). Car count, track, car type and drivers take effect at the next race. Race length applies right away.
 
 **Drivers** (in settings) lists 20 driver slots.
-Turn *Custom* on and car 1 gets slot 1's name, car 2 slot 2's, and so on; turn it off for random drivers each race.
+Turn *Custom* on and car 1 gets slot 1's name, car 2 slot 2's, and so on; turn it off for the standard field.
+Points and records belong to a name, so a renamed driver starts from scratch. *New season* (tap twice) wipes the standings; the records stay.
 Tap a name to type a new one (up to 3 letters or digits), and *Copy this race* fills the slots from the field that's racing now.
 Slots past the number of cars sit out.
 
@@ -118,6 +128,7 @@ race_track/
   effects.h          dust / smoke / spray particles, camera flashes, floodlights, rain / snow / fog / lightning
   cars.h             car classes, liveries, driving AI, drawing
   race.h             grid, start lights, laps, chequered flag, results, event ticker
+  champ.h            championship standings and driver records (NVS)
   settings.h         NVS persistence, choosing the next race
   ui.h               touch, buttons, settings panel, leaderboard, TV camera
   ota_update.h       GitHub-release OTA
