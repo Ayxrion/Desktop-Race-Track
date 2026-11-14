@@ -116,6 +116,11 @@ static void waitStripFree(int b) {
   xSemaphoreGive(stripFree[b]);
 }
 
+// The RGB bus driver's bounce-buffer resync (lovyangfx-fix/Bus_RGB.cpp): frames whose DMA EOF
+// count came out odd are the ones that used to leave the picture shifted until a reboot.
+extern "C" volatile uint32_t lgfx_rgb_bb_frames, lgfx_rgb_bb_odd, lgfx_rgb_bb_last;
+extern "C" volatile bool lgfx_rgb_bb_fix;
+
 static uint32_t lastFrameMs = 0;
 static uint32_t fpsFrames = 0, fpsT0 = 0;
 static uint32_t profAcc[9] = {0}, profT = 0;
@@ -403,6 +408,8 @@ void loop() {
     rowsCopied = rowsRendered = 0;
     Serial.printf("  work avg %.1f max %.1f ms, over %d ms: %u frames\n", workUs / 1000.0f / fpsFrames, workMax / 1000.0f, FRAME_MS, (unsigned)slowFrames);
     workUs = workMax = slowFrames = 0;
+    Serial.printf("  rgb: resync %s, eof/frame %u, odd frames %u of %u\n", lgfx_rgb_bb_fix ? "on" : "OFF",
+                  (unsigned)lgfx_rgb_bb_last, (unsigned)lgfx_rgb_bb_odd, (unsigned)lgfx_rgb_bb_frames);
     fpsFrames = 0; fpsT0 = now;
   }
 }

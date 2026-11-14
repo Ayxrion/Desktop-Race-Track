@@ -92,7 +92,7 @@ Slots past the number of cars sit out.
 Same toolchain as the koi pond:
 
 1. **ESP32 core**: Espressif `esp32` boards package **3.3.0**.
-2. **Libraries**: **LovyanGFX 1.2.21, the FIXED copy** (the two patched files are in [`lovyangfx-fix/`](lovyangfx-fix/)), and **ArduinoJson 6.21.x**.
+2. **Libraries**: **LovyanGFX 1.2.21, the FIXED copy** (the two patched files are in [`lovyangfx-fix/`](lovyangfx-fix/); copy them over the library's `src/lgfx/v1/platforms/esp32s3/` files again whenever they change), and **ArduinoJson 6.21.x**. Besides making the RGB panel work on core 3.x, `Bus_RGB.cpp` works around an ESP-IDF 5.5 driver bug that could leave the picture shifted sideways and flickering until a reboot. The serial stats print `rgb: resync on` when the workaround is active.
 3. **Config**: copy `race_track/wifi_config.h.template` to `race_track/wifi_config.h` and fill it in. That file is gitignored.
 4. Open `race_track/race_track.ino` and set these in the **Tools** menu:
    - Board: **ESP32S3 Dev Module**

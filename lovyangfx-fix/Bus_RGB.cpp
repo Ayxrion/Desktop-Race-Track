@@ -24,6 +24,8 @@ Contributors:
 #include <esp_lcd_panel_rgb.h>
 #include <esp_pm.h>
 #include <esp_log.h>
+#include <esp_memory_utils.h>
+#include <string.h>
 #include <esp_rom_gpio.h>
 #include <rom/gpio.h>
 #include <hal/gdma_ll.h>
@@ -134,6 +136,35 @@ namespace lgfx
     esp_rom_gpio_connect_out_signal(pin, sig, false, false);
   }
 
+  // ── Bounce-buffer resync (IDF 5.5 as shipped in arduino-esp32 3.3.0) ──────────
+  // The driver refills bounce buffer (EOF count % 2) after each DMA EOF, and its
+  // VSYNC restart relaunches the DMA from bounce buffer 0 - but it never resets
+  // that EOF count. Once one EOF interrupt is lost (interrupts held off during a
+  // flash write, for example), every refill lands in the buffer being sent: the
+  // picture tears and shifts sideways, and stays that way until a reboot.
+  // Upstream fixed it by zeroing the count in the restart; the VSYNC callback
+  // runs in the same ISR just before the restart, so zero it there.
+  // The count is a private field; its offset is checked against this build at init.
+  static constexpr size_t RGB_BB_SIZE_OFS  = 136;     // esp_rgb_panel_t::bb_size (bytes)
+  static constexpr size_t RGB_BB_BUF_OFS   = 124;     // esp_rgb_panel_t::bounce_buffer[2]
+  static constexpr size_t RGB_BB_EOF_OFS   = 0x108;   // esp_rgb_panel_t::bb_eof_count
+  extern "C" {
+    volatile uint32_t lgfx_rgb_bb_frames = 0;    // VSYNCs seen
+    volatile uint32_t lgfx_rgb_bb_odd    = 0;    // frames with an odd EOF count (would have desynced)
+    volatile uint32_t lgfx_rgb_bb_last   = 0;    // EOFs in the last frame
+    volatile bool     lgfx_rgb_bb_fix    = false;
+  }
+  static IRAM_ATTR bool rgb_bb_vsync_cb(esp_lcd_panel_handle_t panel, const esp_lcd_rgb_panel_event_data_t*, void*)
+  {
+    volatile uint32_t* cnt = (volatile uint32_t*)((uint8_t*)panel + RGB_BB_EOF_OFS);
+    const uint32_t n = *cnt;
+    *cnt = 0;
+    lgfx_rgb_bb_last = n;
+    ++lgfx_rgb_bb_frames;
+    if (n & 1) ++lgfx_rgb_bb_odd;
+    return false;
+  }
+
   bool Bus_RGB::init(void)
   {
     // Use esp_lcd_new_rgb_panel (IDF native RGB driver) so that GDMA, clock
@@ -186,6 +217,20 @@ namespace lgfx
     }
     if (ESP_OK != esp_lcd_panel_reset(_panel_handle))  { return false; }
     if (ESP_OK != esp_lcd_panel_init(_panel_handle))   { return false; }
+
+    { // the bounce-buffer resync above, only if this build has the expected layout
+      const uint8_t* p = (const uint8_t*)_panel_handle;
+      const uint32_t bbBytes = rgb_cfg.bounce_buffer_size_px * 2;
+      void* const* bufs = (void* const*)(p + RGB_BB_BUF_OFS);
+      if (*(const uint32_t*)(p + RGB_BB_SIZE_OFS) == bbBytes
+          && esp_ptr_internal(bufs[0]) && esp_ptr_internal(bufs[1]) && bufs[0] != bufs[1]) {
+        esp_lcd_rgb_panel_event_callbacks_t cbs;
+        memset(&cbs, 0, sizeof(cbs));
+        cbs.on_vsync = rgb_bb_vsync_cb;
+        lgfx_rgb_bb_fix = ESP_OK == esp_lcd_rgb_panel_register_event_callbacks(_panel_handle, &cbs, nullptr);
+      }
+      if (!lgfx_rgb_bb_fix) ESP_LOGW("Bus_RGB", "bounce-buffer resync not installed (driver layout differs)");
+    }
 
 
     // Obtain the PSRAM frame buffer that IDF allocated.
